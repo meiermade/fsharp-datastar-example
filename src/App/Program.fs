@@ -2,20 +2,17 @@ open Giraffe
 open Microsoft.AspNetCore.Builder
 open Microsoft.Extensions.DependencyInjection
 open Serilog
-open System
 open System.Text.Json
 open System.Collections.Concurrent
 
 type Item =
-    { id:string
-      x:int
+    { x:int
       y:int }
         
-let itemStore = ConcurrentDictionary<string,Item>()
+let itemStore = ConcurrentDictionary<Item,bool>()
 for x in 1 .. 3 do
-    let id = Guid.NewGuid().ToString("N")
-    let item = { id = id; x = x; y = x }
-    itemStore.TryAdd(id, item) |> ignore
+    let item = { x = x; y = x }
+    itemStore.TryAdd(item, true) |> ignore
 
 module Json =
     let serialize (value:'T) = JsonSerializer.Serialize(value)
@@ -125,6 +122,7 @@ module View =
     let createChartData (items:Item list) =
         items
         |> Seq.map (fun item -> [| item.x; item.y |])
+        |> Seq.sort
         |> Seq.toArray
         
     let itemsChart (items:Item list) =
@@ -140,17 +138,37 @@ module View =
             _children [
                 div [
                     _id "item-chart"
+                    _data ("on:chart-clicked", "$x = event.detail.x; $y = event.detail.y; @post('/items')")
                     _class "w-full h-96 mb-4"
                 ]
                 // language=javascript
                 script """
                 var chartDom = document.getElementById('item-chart');
                 var myChart = echarts.init(chartDom, {renderer: 'svg'});
+                myChart.getZr().on('click', function(params) {
+                    const pointInPixel = [params.offsetX, params.offsetY];
+                    const pointInGrid = myChart.convertFromPixel({ seriesIndex: 0 }, pointInPixel);
+                    // check if click was inside plot area
+                    const [x, y] = pointInGrid;
+                    if (!isNaN(x) && !isNaN(y)) {
+                        chartDom.dispatchEvent(new CustomEvent('chart-clicked', {
+                            detail: { x: Math.round(x), y: Math.round(y) }
+                        }));
+                    }
+                });
 
                 function renderChart(data) {
                     var options = {
-                        xAxis: { type: 'value', name: 'X Value' },
-                        yAxis: { type: 'value', name: 'Y Value' },
+                        xAxis: {
+                            type: 'value',
+                            name: 'X Value',
+                            minInterval: 1
+                        },
+                        yAxis: {
+                            type: 'value',
+                            name: 'Y Value',
+                            minInterval: 1
+                        },
                         series: [{
                             type: 'scatter',
                             data: data
@@ -160,7 +178,7 @@ module View =
                 }
                 """
                 pre [
-                    _data ("json-signals__terse", "{include: /^_itemsChartData$/ }")
+                    _data "json-signals"
                     _class "bg-gray-100 p-4 rounded-md overflow-x-auto max-h-64"
                 ]
             ]
@@ -176,16 +194,21 @@ module View =
                     _class "text-center text-3xl font-bold mb-4"
                     _children "Items"
                 ]
-                p [ _class "font-bold p-2 mb-2"; _children "Create Item" ]
                 form [
                     _id "create-item-form"
-                    _data ("on:submit", "@post('/items', {contentType: 'form'})")
-                    _class "grid grid-cols-1 gap-4 sm:grid-cols-3 border border-gray-200 p-4 rounded-md bg-white"
+                    _data ("on:submit", "@post('/items')")
+                    _class "w-full border border-gray-200 p-4 rounded-md bg-white"
                     _children [
-                        field ("x", "x value", "number")
-                        field ("y", "y value", "number")
+                        p [ _class "mb-4 font-bold"; _children "Create Item" ]
                         div [
-                            _class "col-span-full flex space-x-2"
+                            _class "mb-4 grid grid-cols-1 gap-4 sm:grid-cols-3 "
+                            _children [
+                                field ("x", "x value", "number")
+                                field ("y", "y value", "number")
+                            ]
+                        ]
+                        div [
+                            _class "w-full flex gap-4"
                             _children [
                                 button [
                                     _type "submit"
@@ -195,7 +218,7 @@ module View =
                                 button [
                                     _type "button"
                                     _class "btn btn-sm btn-secondary"
-                                    _data ("on:click", "@post('/items/random')")
+                                    _data ("on:click", "$x = Math.floor(Math.random() * 11); $y = Math.floor(Math.random() * 11); @post('/items')")
                                     _children "Random"
                                 ]
                             ]
@@ -237,51 +260,30 @@ module Handler =
                 return! htmlString html next ctx
         }
         
-    let createRandomItem : HttpHandler =
-        fun next ctx -> task {
-            let id = Guid.NewGuid().ToString("N")
-            let random = Random()
-            let x = random.Next(1, 10)
-            let y = random.Next(1, 10)
-            let item:Item = { id = id; x = x; y = y }
-            Log.Debug("👉 Adding item to store {item}", item)
-            itemStore.TryAdd(id, item) |> ignore
-            return! dispatch "item-created" next ctx
-        }
-        
     let createItem : HttpHandler =
         fun next ctx -> task {
-            let! form = ctx.TryBindFormAsync<Model.ItemForm>()
-            match form with
-            | Ok data ->
-                let id = Guid.NewGuid().ToString("N")
-                let item:Item = { id = id; x = data.x; y = data.y }
-                Log.Debug("👉 Adding item to store {item}", item)
-                itemStore.TryAdd(id, item) |> ignore
+            let! signals = ctx.BindJsonAsync<{| x:int; y:int |}>()
+            match signals.x, signals.y with
+            | x, y when x >= 0 && y >= 0 ->
+                Log.Information("👉 Creating item at ({x}, {y})", x, y)
+                let item:Item = { x = signals.x; y = signals.y }
+                itemStore.TryAdd(item, true) |> ignore
                 return! dispatch "item-created" next ctx
-            | Error err ->
-                Log.Error(err)
-                return! RequestErrors.BAD_REQUEST "Error" next ctx
+            | _ ->
+                Log.Warning("⚠️ Invalid item coordinates ({x}, {y})", signals.x, signals.y)
+                return! Successful.NO_CONTENT next ctx
         }
         
     let getItemsPage : HttpHandler =
         fun next ctx -> task {
-            let items = itemStore.Values |> Seq.toList
+            let items = itemStore.Keys |> Seq.toList
             let page = View.itemsPage items
             return! renderPage page next ctx
         }
         
-    let getItemsChart : HttpHandler =
-        fun next ctx -> task {
-            let items = itemStore.Values |> Seq.toList
-            let chart = View.itemsChart items
-            let handler = setHttpHeader "datastar-mode" "replace" >=> renderView chart
-            return! handler next ctx
-        }
-        
     let getItemsData : HttpHandler =
         fun next ctx -> task {
-            let items = itemStore.Values |> Seq.toList
+            let items = itemStore.Keys |> Seq.toList
             let data = View.createChartData items
             let signals = {| _itemsChartData = data |}
             return! json signals next ctx
@@ -289,13 +291,9 @@ module Handler =
         
     let itemsApp : HttpHandler =
         choose [
-            POST >=> choose [
-                routex "(/?)" >=> createItem
-                route "/random" >=> createRandomItem
-            ]
+            POST >=> createItem
             GET >=> choose [
                 routex "(/?)" >=> getItemsPage
-                route "/chart" >=> getItemsChart
                 route "/data" >=> getItemsData
             ]
         ]
