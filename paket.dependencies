@@ -1,0 +1,7 @@
+source https://api.nuget.org/v3/index.json
+storage: none
+
+nuget FSharp.ViewEngine
+nuget Giraffe
+nuget Serilog.AspNetCore
+nuget StarFederation.Datastar

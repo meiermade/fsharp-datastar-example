@@ -1,0 +1,8 @@
+﻿.idea
+.vscode
+.paket
+paket-files
+obj
+bin
+out
+*.DotSettings.user
