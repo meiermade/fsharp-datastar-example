@@ -2,8 +2,6 @@ open Giraffe
 open Microsoft.AspNetCore.Builder
 open Microsoft.Extensions.DependencyInjection
 open Serilog
-open StarFederation.Datastar
-open StarFederation.Datastar.DependencyInjection
 open System
 open System.Text.Json
 open System.Collections.Concurrent
@@ -246,7 +244,7 @@ module Handler =
             let x = random.Next(1, 10)
             let y = random.Next(1, 10)
             let item:Item = { id = id; x = x; y = y }
-            Log.Information("👉 Adding item to store {item}", item)
+            Log.Debug("👉 Adding item to store {item}", item)
             itemStore.TryAdd(id, item) |> ignore
             return! dispatch "item-created" next ctx
         }
@@ -258,7 +256,7 @@ module Handler =
             | Ok data ->
                 let id = Guid.NewGuid().ToString("N")
                 let item:Item = { id = id; x = data.x; y = data.y }
-                Log.Information("👉 Adding item to store {item}", item)
+                Log.Debug("👉 Adding item to store {item}", item)
                 itemStore.TryAdd(id, item) |> ignore
                 return! dispatch "item-created" next ctx
             | Error err ->
@@ -269,7 +267,6 @@ module Handler =
     let getItemsPage : HttpHandler =
         fun next ctx -> task {
             let items = itemStore.Values |> Seq.toList
-            Log.Information("👉 Retrieved {count} items", items.Length)
             let page = View.itemsPage items
             return! renderPage page next ctx
         }
@@ -277,7 +274,6 @@ module Handler =
     let getItemsChart : HttpHandler =
         fun next ctx -> task {
             let items = itemStore.Values |> Seq.toList
-            Log.Information("👉 Retrieved {count} items for chart", items.Length)
             let chart = View.itemsChart items
             let handler = setHttpHeader "datastar-mode" "replace" >=> renderView chart
             return! handler next ctx
@@ -286,7 +282,6 @@ module Handler =
     let getItemsData : HttpHandler =
         fun next ctx -> task {
             let items = itemStore.Values |> Seq.toList
-            Log.Information("👉 Retrieved {count} items for chart", items.Length)
             let data = View.createChartData items
             let signals = {| _itemsChartData = data |}
             return! json signals next ctx
@@ -311,15 +306,12 @@ module Handler =
             subRoute "/items" itemsApp
         ]
 
-let configureApp (builder: WebApplication) =
-    builder
-        .UseRouting()
-        .UseGiraffe(Handler.app)
+let configureApp (app: WebApplication) =
+    app.UseGiraffe(Handler.app)
         
 let configureServices (services: IServiceCollection) =
     services
         .AddSerilog()
-        .AddDatastar()
         .AddGiraffe() |> ignore
 
 [<EntryPoint>]

@@ -1,5 +1,7 @@
 ﻿# F# Datastar Example
 
+![app gif](./etc/fsharp-datastar-example.gif)
+
 ## Setup
 Install .NET SDK.
 ```shell
