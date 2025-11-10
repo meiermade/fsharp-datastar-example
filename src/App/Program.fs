@@ -14,17 +14,8 @@ for x in 1 .. 3 do
     let item = { x = x; y = x }
     itemStore.TryAdd(item, true) |> ignore
 
-module Json =
-    let serialize (value:'T) = JsonSerializer.Serialize(value)
-    
 module Js =
     let serialize (value:'T) = JsonSerializer.Serialize(value).Replace("\"", "'")
-
-module Model =
-    [<CLIMutable>]
-    type ItemForm =
-        { x:int
-          y:int }
 
 module View =
     open FSharp.ViewEngine
