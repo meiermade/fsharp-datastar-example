@@ -2,20 +2,25 @@ open Giraffe
 open Microsoft.AspNetCore.Builder
 open Microsoft.Extensions.DependencyInjection
 open Serilog
+open System
 open System.Text.Json
 open System.Collections.Concurrent
 
-type Item =
-    { x:int
-      y:int }
-        
-let itemStore = ConcurrentDictionary<Item,bool>()
-for x in 1 .. 3 do
-    let item = { x = x; y = x }
-    itemStore.TryAdd(item, true) |> ignore
-
 module Js =
     let serialize (value:'T) = JsonSerializer.Serialize(value).Replace("\"", "'")
+    
+module Guid =
+    let create () = Guid.CreateVersion7()
+
+type Item =
+    { id:Guid
+      x:int
+      y:int }
+        
+let itemStore = ConcurrentDictionary<int*int,Guid>()
+for x in 1 .. 3 do
+    let guid = Guid.create()
+    itemStore.TryAdd((x, x), guid) |> ignore
 
 module View =
     open FSharp.ViewEngine
@@ -67,7 +72,7 @@ module View =
             ]
         ]
         
-    let field (id:string, labelName:string, inputType:string) =
+    let numberField (id:string, labelName:string, min:int, max:int) =
         label [
             _class "input"
             _children [
@@ -76,9 +81,11 @@ module View =
                     _children labelName
                 ]
                 input [
-                    _type inputType
+                    _type "number"
                     _data ("bind", id)
                     _name id
+                    _min min
+                    _max max
                 ]
             ]
         ]
@@ -110,13 +117,13 @@ module View =
             ]
         ]
         
-    let createChartData (items:Item list) =
+    let createChartData (items:Item seq) =
         items
+        |> Seq.sortBy _.id
         |> Seq.map (fun item -> [| item.x; item.y |])
-        |> Seq.sort
         |> Seq.toArray
         
-    let itemsChart (items:Item list) =
+    let itemsChart (items:Item seq) =
         let chartData = createChartData items
         let signals = {| _itemsChartData = chartData |}
         let signalsJs = Js.serialize signals
@@ -153,16 +160,34 @@ module View =
                         xAxis: {
                             type: 'value',
                             name: 'X Value',
-                            minInterval: 1
+                            minInterval: 1,
+                            min: 0,
+                            max: 10
                         },
                         yAxis: {
                             type: 'value',
                             name: 'Y Value',
-                            minInterval: 1
+                            minInterval: 1,
+                            min: 0,
+                            max: 10
+                        },
+                        tooltip: {
+                            trigger: 'item', // show on point hover
+                            formatter: (params) => {
+                                const [x, y] = params.value;
+                                return `(${x},${y})`;
+                            }
                         },
                         series: [{
                             type: 'scatter',
-                            data: data
+                            data: data,
+                            universalTransition: false,
+                            animationDurationUpdate: (idx) => {
+                                return idx === data.length - 1 ? 500 : 0;
+                            },
+                            animationDelayUpdate: (idx) => {
+                                return idx === data.length - 1 ? 0 : 0;
+                            }
                         }]
                     };
                     myChart.setOption(options);
@@ -175,7 +200,7 @@ module View =
             ]
         ]
         
-    let itemsPage (items:Item list) =
+    let itemsPage (items:Item seq) =
         div [
             _id "page"
             _data ("init", "$selectedNav = 'items'; window.history.replaceState({}, '', '/items')")
@@ -194,8 +219,8 @@ module View =
                         div [
                             _class "mb-4 grid grid-cols-1 gap-4 sm:grid-cols-3 "
                             _children [
-                                field ("x", "x value", "number")
-                                field ("y", "y value", "number")
+                                numberField ("x", "x value", 0, 10)
+                                numberField ("y", "y value", 0, 10)
                             ]
                         ]
                         div [
@@ -255,10 +280,12 @@ module Handler =
         fun next ctx -> task {
             let! signals = ctx.BindJsonAsync<{| x:int; y:int |}>()
             match signals.x, signals.y with
-            | x, y when x >= 0 && y >= 0 ->
+            | x, y when x >= 0 && x <= 10 && y >= 0 && y <= 10 ->
                 Log.Information("👉 Creating item at ({x}, {y})", x, y)
-                let item:Item = { x = signals.x; y = signals.y }
-                itemStore.TryAdd(item, true) |> ignore
+                let id = Guid.create()
+                let x = signals.x
+                let y = signals.y
+                itemStore.TryAdd((x, y), id) |> ignore
                 return! dispatch "item-created" next ctx
             | _ ->
                 Log.Warning("⚠️ Invalid item coordinates ({x}, {y})", signals.x, signals.y)
@@ -267,14 +294,22 @@ module Handler =
         
     let getItemsPage : HttpHandler =
         fun next ctx -> task {
-            let items = itemStore.Keys |> Seq.toList
+            let items =
+                itemStore
+                |> Seq.map (fun kvp ->
+                    let x, y = kvp.Key
+                    { id = kvp.Value; x = x; y = y })
             let page = View.itemsPage items
             return! renderPage page next ctx
         }
         
     let getItemsData : HttpHandler =
         fun next ctx -> task {
-            let items = itemStore.Keys |> Seq.toList
+            let items =
+                itemStore
+                |> Seq.map (fun kvp ->
+                    let x, y = kvp.Key
+                    { id = kvp.Value; x = x; y = y })
             let data = View.createChartData items
             let signals = {| _itemsChartData = data |}
             return! json signals next ctx
