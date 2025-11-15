@@ -1,3 +1,4 @@
+open FSharp.Data.Adaptive
 open Giraffe
 open Microsoft.AspNetCore.Builder
 open Microsoft.Extensions.DependencyInjection
@@ -21,6 +22,51 @@ let itemStore = ConcurrentDictionary<int*int,Guid>()
 for x in 1 .. 3 do
     let guid = Guid.create()
     itemStore.TryAdd((x, x), guid) |> ignore
+    
+[<AutoOpen>]
+module AdaptiveExtensions =
+    let ( +. ) (a:aval<decimal>) (b:aval<decimal>) : aval<decimal> =
+        AVal.map2 (+) a b
+    let ( -. ) (a:aval<decimal>) (b:aval<decimal>) : aval<decimal> =
+        AVal.map2 (-) a b
+    let ( *. ) (a:aval<decimal>) (b:aval<decimal>) : aval<decimal> =
+        AVal.map2 (*) a b
+    
+type Statement =
+    { date: DateOnly
+      withdrawals: cval<decimal>
+      deposits: cval<decimal>
+      balance: aval<decimal> }
+    with
+        member this.changes = this.deposits -. this.withdrawals
+
+module Statement =
+    let initialStatement date =
+        let withdrawals = cval 0m
+        let deposits = cval 0m
+        { date = date
+          withdrawals = withdrawals
+          deposits = deposits
+          balance = deposits -. withdrawals }
+        
+    let createStatement prev =
+        let withdrawals = cval 0m
+        let deposits = cval 0m
+        { date = prev.date.AddMonths(1)
+          withdrawals = withdrawals
+          deposits = deposits
+          balance = prev.balance +. deposits -. withdrawals }
+    
+    let statements =
+        let date = DateOnly(2025, 1, 1)
+        let mutable statement = initialStatement date
+        [| for i in 0..11 do
+               if i = 0 then
+                   yield statement
+               else
+                   statement <- createStatement statement
+                   yield statement |]
+    
 
 module View =
     open FSharp.ViewEngine
@@ -42,6 +88,7 @@ module View =
             _children [
                 navLink ("home", "Home", "/")
                 navLink ("items", "Items", "/items")
+                navLink ("statements", "Statements", "/statements")
             ]
         ]
     
@@ -64,7 +111,7 @@ module View =
                     _children [
                         navbar
                         div [
-                            _class "max-w-4xl mx-auto py-8"
+                            _class "max-w-7xl mx-auto py-8"
                             _children page
                         ]
                     ]
@@ -244,6 +291,117 @@ module View =
                 itemsChart items
             ]
         ]
+        
+    let statementsPage (statements:Statement[]) =
+        div [
+            _id "page"
+            _data ("init", "$selectedNav = 'statements'; window.history.replaceState({}, '', '/statements')")
+            _data ("on:deposits-change", "$amount = evt.detail.amount; @post(`/statements/${evt.detail.idx}/deposits`)")
+            _data ("on:withdrawals-change", "$amount = evt.detail.amount; @post(`/statements/${evt.detail.idx}/withdrawals`)")
+            _children [
+                h1 [
+                    _class "text-center text-3xl font-bold mb-4"
+                    _children "Statements"
+                ]
+                div [
+                    _class "overflow-x-auto"
+                    _children [
+                        table [
+                            _class "table table-sm"
+                            _children [
+                                thead [
+                                    tr [
+                                        th [
+                                            _children "Date"
+                                        ]
+                                        for statement in statements do
+                                            th [
+                                                _children (statement.date.ToString("yyyy-MM-dd"))
+                                            ]
+                                    ]
+                                ]
+                                tbody [
+                                    _children [
+                                        tr [
+                                            _children [
+                                                th [
+                                                    _children "Deposits"
+                                                ]
+                                                for i in 0..statements.Length - 1 do
+                                                    td [
+                                                        _children [
+                                                            input [
+                                                                _class "input"
+                                                                _type "number"
+                                                                _data ("on:change", $$"""el.dispatchEvent(new CustomEvent('deposits-change', { detail: { idx: {{ i }}, amount: el.value }, bubbles: true }))""")
+                                                                _value (string statements[i].withdrawals.Value)
+                                                                _min 0
+                                                                _max 1_000_000
+                                                            ]
+                                                        ]
+                                                    ]
+                                            ]
+                                        ]
+                                        tr [
+                                            _children [
+                                                th [
+                                                    _children "Withdrawals"
+                                                ]
+                                                for i in 0..statements.Length - 1 do
+                                                    td [
+                                                        _children [
+                                                            input [
+                                                                _class "input"
+                                                                _type "number"
+                                                                _data ("on:change", $$"""el.dispatchEvent(new CustomEvent('withdrawals-change', { detail: { idx: {{ i }}, amount: el.value }, bubbles: true }))""")
+                                                                _value (string statements[i].withdrawals.Value)
+                                                                _min 0
+                                                                _max 1_000_000
+                                                            ]
+                                                        ]
+                                                    ]
+                                            ]
+                                        ]
+                                        tr [
+                                            _children [
+                                                th [
+                                                    _children "Changes"
+                                                ]
+                                                for i in 0..statements.Length - 1 do
+                                                    td [
+                                                        _children [
+                                                            span [
+                                                                _class "input bg-gray-100"
+                                                                _children (statements[i].changes |> AVal.force |> string)
+                                                            ]
+                                                        ]
+                                                    ]
+                                            ]
+                                        ]
+                                        tr [
+                                            _children [
+                                                th [
+                                                    _children "Balances"
+                                                ]
+                                                for i in 0..statements.Length - 1 do
+                                                    td [
+                                                        _children [
+                                                            span [
+                                                                _class "input bg-gray-100"
+                                                                _children (statements[i].balance |> AVal.force |> string)
+                                                            ]
+                                                        ]
+                                                    ]
+                                            ]
+                                        ]
+                                    ]
+                                ]
+                            ]
+                        ]
+                    ]
+                ]
+            ]
+        ]
 
 
 module Handler =
@@ -324,10 +482,44 @@ module Handler =
             ]
         ]
         
+    let getStatementsPage : HttpHandler =
+        fun next ctx -> task {
+            let page = View.statementsPage Statement.statements
+            return! renderPage page next ctx
+        }
+        
+    let updateStatementDeposits (idx:int) : HttpHandler =
+        fun next ctx -> task {
+            let! signals = ctx.BindJsonAsync<{| amount:string |}>()
+            Log.Information("👉 Updating statement {i} deposits to {amount}", idx, signals.amount)
+            transact(fun () -> Statement.statements[idx].deposits.Value <- decimal signals.amount)
+            return! getStatementsPage next ctx
+        }
+        
+    let updateStatementWithdrawals (idx:int) : HttpHandler =
+        fun next ctx -> task {
+            let! signals = ctx.BindJsonAsync<{| amount:string |}>()
+            Log.Information("👉 Updating statement {i} withdrawals to {amount}", idx, signals.amount)
+            transact(fun () -> Statement.statements[idx].withdrawals.Value <- decimal signals.amount)
+            return! getStatementsPage next ctx
+        }
+        
+    let statementsApp : HttpHandler =
+        choose [
+            routex "(/?)" >=> GET >=> getStatementsPage
+            routef "/%i/deposits" (fun idx -> choose [
+                POST >=> updateStatementDeposits idx
+            ])
+            routef "/%i/withdrawals" (fun idx -> choose [
+                POST >=> updateStatementWithdrawals idx
+            ])
+        ]
+        
     let app:HttpHandler =
         choose [
             route "/" >=> renderPage View.homePage
             subRoute "/items" itemsApp
+            subRoute "/statements" statementsApp
         ]
 
 let configureApp (app: WebApplication) =

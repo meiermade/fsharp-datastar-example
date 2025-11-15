@@ -2,3 +2,4 @@ Giraffe
 Serilog.AspNetCore
 FSharp.ViewEngine
 Serilog.Sinks.Console
+FSharp.Data.Adaptive
