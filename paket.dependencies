@@ -1,7 +1,9 @@
 source https://api.nuget.org/v3/index.json
 storage: none
 
+nuget FSharp.Core ~> 9
 nuget FSharp.Data.Adaptive
 nuget FSharp.ViewEngine
 nuget Giraffe
 nuget Serilog.AspNetCore
+nuget Starfederation.Datastar

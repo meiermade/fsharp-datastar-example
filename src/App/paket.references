@@ -1,5 +1,7 @@
+FSharp.Core
+FSharp.Data.Adaptive
+FSharp.ViewEngine
 Giraffe
 Serilog.AspNetCore
-FSharp.ViewEngine
 Serilog.Sinks.Console
-FSharp.Data.Adaptive
+Starfederation.Datastar

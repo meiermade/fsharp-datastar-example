@@ -1,17 +1,23 @@
 open FSharp.Data.Adaptive
 open Giraffe
 open Microsoft.AspNetCore.Builder
+open Microsoft.AspNetCore.Http
 open Microsoft.Extensions.DependencyInjection
 open Serilog
 open System
 open System.Text.Json
+open System.Threading.Tasks
 open System.Collections.Concurrent
+open StarFederation.Datastar.DependencyInjection
 
 module Js =
     let serialize (value:'T) = JsonSerializer.Serialize(value).Replace("\"", "'")
     
 module Guid =
     let create () = Guid.CreateVersion7()
+    
+type Signals =
+    { selectedNav: string }
 
 type Item =
     { id:Guid
@@ -72,6 +78,15 @@ module View =
     open FSharp.ViewEngine
     open type Html
     
+    type Page =
+        static member primary(content:Element seq, ?attrs:Attribute seq) =
+            let attrs = defaultArg attrs Seq.empty
+            div [
+                _id "page"
+                _children content
+                yield! attrs
+            ]
+    
     let navLink (id:string, name:string, href:string) =
         a [
             _data ("on:click", $"@get('{href}')")
@@ -89,10 +104,11 @@ module View =
                 navLink ("home", "Home", "/")
                 navLink ("items", "Items", "/items")
                 navLink ("statements", "Statements", "/statements")
+                navLink ("time", "Time", "/time")
             ]
         ]
     
-    let layout (page:Element) =
+    let layout (page:Element, signals:Signals) =
         html [
             _lang "en"
             _data ("theme", "emerald")
@@ -108,6 +124,7 @@ module View =
                     script [ _src "https://unpkg.com/echarts@6.0.0/dist/echarts.min.js" ]
                 ]
                 body [
+                    _data ("signals", Js.serialize signals)
                     _children [
                         navbar
                         div [
@@ -138,31 +155,33 @@ module View =
         ]
         
     let homePage =
-        div [
-            _id "page"
-            _data ("init", "$selectedNav = 'home'; window.history.replaceState({}, '', '/')")
-            _class "hero"
-            _children [
+        Page.primary(
+            content=[
                 div [
-                    _class "hero-content text-center"
+                    _class "hero"
                     _children [
                         div [
-                            _class "max-w-md"
+                            _class "hero-content text-center"
                             _children [
-                                h1 [
-                                    _class "text-5xl font-bold"
-                                    _children "F# Datastar Example"
-                                ]
-                                p [
-                                    _class "py-6"
-                                    _children "Testing out Datastar with F# and Giraffe."
+                                div [
+                                    _class "max-w-md"
+                                    _children [
+                                        h1 [
+                                            _class "text-5xl font-bold"
+                                            _children "F# Datastar Example"
+                                        ]
+                                        p [
+                                            _class "py-6"
+                                            _children "Testing out Datastar with F# and Giraffe."
+                                        ]
+                                    ]
                                 ]
                             ]
                         ]
                     ]
                 ]
             ]
-        ]
+        )
         
     let createChartData (items:Item seq) =
         items
@@ -293,12 +312,12 @@ module View =
         ]
         
     let statementsPage (statements:Statement[]) =
-        div [
-            _id "page"
-            _data ("init", "$selectedNav = 'statements'; window.history.replaceState({}, '', '/statements')")
-            _data ("on:deposits-change", "$amount = evt.detail.amount; @post(`/statements/${evt.detail.idx}/deposits`)")
-            _data ("on:withdrawals-change", "$amount = evt.detail.amount; @post(`/statements/${evt.detail.idx}/withdrawals`)")
-            _children [
+        Page.primary(
+            attrs=[
+                _data ("on:deposits-change", "$amount = evt.detail.amount; @post(`/statements/${evt.detail.idx}/deposits`)")
+                _data ("on:withdrawals-change", "$amount = evt.detail.amount; @post(`/statements/${evt.detail.idx}/withdrawals`)")
+            ],
+            content=[
                 h1 [
                     _class "text-center text-3xl font-bold mb-4"
                     _children "Statements"
@@ -401,41 +420,99 @@ module View =
                     ]
                 ]
             ]
+        )
+        
+    let currentTimeElement (currentTime:DateTimeOffset) =
+        p [
+            _id "current-time"
+            _class "text-center"
+            _children (currentTime.ToString("yyyy-MM-dd HH:mm:ss"))
         ]
-
+        
+    let timePage (currentTime:DateTimeOffset) =
+        Page.primary(
+            attrs=[
+                _data ("signals:controller", "new AbortController()")
+                _data ("init", "@get('/time/update', { requestCancellation: $controller })")
+            ],
+            content=[
+                h1 [
+                    _class "text-center text-3xl font-bold mb-4"
+                    _children "Current Time"
+                ]
+                div [
+                    _class "flex justify-center space-x-4"
+                    _children [
+                        currentTimeElement currentTime
+                        button [
+                            _data ("on:click", "$controller = new AbortController(); @get('/time/update', { requestCancellation: $controller })")
+                            _class "btn btn-sm btn-primary"
+                            _children "Start"
+                        ]
+                        button [
+                            _data ("on:click", "$controller.abort()")
+                            _class "btn btn-sm btn-secondary"
+                            _children "Stop"
+                        ]
+                    ]
+                ]
+            ]
+        )
 
 module Handler =
     open FSharp.ViewEngine
     
-    let renderView (view:Element) : HttpHandler =
+    type HttpContext with
+        member this.IsDatastar =
+            match this.TryGetRequestHeader("Datastar-Request") with
+            | Some "true" -> true
+            | _ -> false
+            
+    let inline patchSignals (ds:IDatastarService) (signals:'T) = task {
+        do! ds.PatchSignalsAsync(signals)
+    }
+    
+    let patchElement (ds:IDatastarService) (element:Element) = task {
+        let html = Element.render element
+        do! ds.PatchElementsAsync(html)
+    }
+    
+    let dispatchEvent (ds:IDatastarService) (name:string) = task {
+        // language=javascript
+        let js = $$"""window.dispatchEvent(new CustomEvent('{{ name }}', { bubbles: true }))"""
+        do! ds.ExecuteScriptAsync(js)
+    }
+    
+    let pushUrl (ds:IDatastarService) (url:string) = task {
+        // language=javascript
+        let js = $$"""window.history.pushState({}, '', '{{ url }}')"""
+        do! ds.ExecuteScriptAsync(js)
+    }
+    
+    let renderPage (page:Element, signals:Signals) : HttpHandler =
         fun next ctx -> task {
-            let html = Element.render view
+            let html = View.layout (page, signals) |> Element.render
             return! htmlString html next ctx
         }
         
-    let javascriptString (script:string) : HttpHandler =
-        setContentType "text/javascript"
-        >=> setBodyFromString script
-        
-    let dispatch (name:string) : HttpHandler =
+    let getHomePage : HttpHandler =
         fun next ctx -> task {
-            // language=javascript
-            let js = $"window.dispatchEvent(new CustomEvent('{ name }'))"
-            return! javascriptString js next ctx
-        }
-    
-    let renderPage (page:Element) : HttpHandler =
-        fun next ctx -> task {
-            match ctx.TryGetRequestHeader("Datastar-Request") with
-            | Some "true" ->
-                return! renderView page next ctx
-            | _ ->
-                let html = View.layout page |> Element.render
-                return! htmlString html next ctx
+            let page = View.homePage
+            let signals = { selectedNav = "home" }
+            if ctx.IsDatastar then
+                let ds = ctx.GetService<IDatastarService>()
+                do! patchElement ds page
+                do! patchSignals ds signals
+                do! pushUrl ds "/"
+                return Some ctx
+            else
+                return! renderPage (page, signals) next ctx
         }
         
     let createItem : HttpHandler =
         fun next ctx -> task {
+            if not ctx.IsDatastar then failwith "Not a Datastar request"
+            let ds = ctx.GetService<IDatastarService>()
             let! signals = ctx.BindJsonAsync<{| x:int; y:int |}>()
             match signals.x, signals.y with
             | x, y when x >= 0 && x <= 10 && y >= 0 && y <= 10 ->
@@ -444,7 +521,8 @@ module Handler =
                 let x = signals.x
                 let y = signals.y
                 itemStore.TryAdd((x, y), id) |> ignore
-                return! dispatch "item-created" next ctx
+                do! dispatchEvent ds "item-created"
+                return Some ctx
             | _ ->
                 Log.Warning("⚠️ Invalid item coordinates ({x}, {y})", signals.x, signals.y)
                 return! Successful.NO_CONTENT next ctx
@@ -458,11 +536,20 @@ module Handler =
                     let x, y = kvp.Key
                     { id = kvp.Value; x = x; y = y })
             let page = View.itemsPage items
-            return! renderPage page next ctx
+            let signals = { selectedNav = "items" }
+            if ctx.IsDatastar then
+                let ds = ctx.GetService<IDatastarService>()
+                do! patchSignals ds signals
+                do! patchElement ds page 
+                do! pushUrl ds "/items"
+                return Some ctx
+            else
+                return! renderPage (page, signals) next ctx
         }
         
     let getItemsData : HttpHandler =
-        fun next ctx -> task {
+        fun _next ctx -> task {
+            if not ctx.IsDatastar then failwith "Not a Datastar request"
             let items =
                 itemStore
                 |> Seq.map (fun kvp ->
@@ -470,7 +557,9 @@ module Handler =
                     { id = kvp.Value; x = x; y = y })
             let data = View.createChartData items
             let signals = {| _itemsChartData = data |}
-            return! json signals next ctx
+            let ds = ctx.GetService<IDatastarService>()
+            do! patchSignals ds signals
+            return Some ctx
         }
         
     let itemsApp : HttpHandler =
@@ -485,12 +574,22 @@ module Handler =
     let getStatementsPage : HttpHandler =
         fun next ctx -> task {
             let page = View.statementsPage Statement.statements
-            return! renderPage page next ctx
+            let signals = { selectedNav = "statements" }
+            if ctx.IsDatastar then
+                let ds = ctx.GetService<IDatastarService>()
+                do! patchElement ds page
+                do! patchSignals ds { selectedNav = "statements" }
+                do! pushUrl ds "/statements"
+                return Some ctx
+            else
+                return! renderPage (page, signals) next ctx
         }
         
     let updateStatementDeposits (idx:int) : HttpHandler =
         fun next ctx -> task {
-            let! signals = ctx.BindJsonAsync<{| amount:string |}>()
+            if not ctx.IsDatastar then failwith "Not a Datastar request"
+            let ds = ctx.GetService<IDatastarService>()
+            let! signals = ds.ReadSignalsAsync<{| amount:string |}>()
             Log.Information("👉 Updating statement {i} deposits to {amount}", idx, signals.amount)
             transact(fun () -> Statement.statements[idx].deposits.Value <- decimal signals.amount)
             return! getStatementsPage next ctx
@@ -498,7 +597,9 @@ module Handler =
         
     let updateStatementWithdrawals (idx:int) : HttpHandler =
         fun next ctx -> task {
-            let! signals = ctx.BindJsonAsync<{| amount:string |}>()
+            if not ctx.IsDatastar then failwith "Not a Datastar request"
+            let ds = ctx.GetService<IDatastarService>()
+            let! signals = ds.ReadSignalsAsync<{| amount:string |}>()
             Log.Information("👉 Updating statement {i} withdrawals to {amount}", idx, signals.amount)
             transact(fun () -> Statement.statements[idx].withdrawals.Value <- decimal signals.amount)
             return! getStatementsPage next ctx
@@ -515,11 +616,47 @@ module Handler =
             ])
         ]
         
+    let getTimePage : HttpHandler =
+        fun next ctx -> task {
+            let currentTime = DateTimeOffset.UtcNow
+            let page = View.timePage currentTime
+            let signals = { selectedNav = "time" }
+            if ctx.IsDatastar then
+                let ds = ctx.GetService<IDatastarService>()
+                do! patchElement ds page
+                do! patchSignals ds signals
+                do! pushUrl ds "/time"
+                return Some ctx
+            else
+                return! renderPage (page, signals) next ctx
+        }
+        
+    let getUpdatedTime : HttpHandler =
+        fun _next ctx -> task {
+            if not ctx.IsDatastar then failwith "Not a Datastar request"
+            let ds = ctx.GetService<IDatastarService>()
+            while true do
+                do! Task.Delay(1_000)
+                let currentTime = DateTimeOffset.UtcNow
+                let currentTimeElement = View.currentTimeElement currentTime
+                do! patchElement ds currentTimeElement
+            return Some ctx
+        }
+        
+    let timeApp : HttpHandler =
+        choose [
+            GET >=> choose [
+                routex "(/?)" >=> getTimePage
+                route "/update" >=> getUpdatedTime
+            ]
+        ]
+        
     let app:HttpHandler =
         choose [
-            route "/" >=> renderPage View.homePage
+            route "/" >=> getHomePage
             subRoute "/items" itemsApp
             subRoute "/statements" statementsApp
+            subRoute "/time" timeApp
         ]
 
 let configureApp (app: WebApplication) =
@@ -528,6 +665,7 @@ let configureApp (app: WebApplication) =
 let configureServices (services: IServiceCollection) =
     services
         .AddSerilog()
+        .AddDatastar()
         .AddGiraffe() |> ignore
 
 [<EntryPoint>]
