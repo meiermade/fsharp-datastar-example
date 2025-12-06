@@ -16,6 +16,14 @@ module Js =
 module Guid =
     let create () = Guid.CreateVersion7()
     
+module DateOnly =
+    let daysBetween (startDate:DateOnly) (endDate:DateOnly) =
+        endDate.DayNumber - startDate.DayNumber
+    let range (startDate:DateOnly) (endDate:DateOnly) =
+        Seq.initInfinite startDate.AddDays
+        |> Seq.takeWhile (fun d -> d <= endDate)
+        |> Seq.toList
+    
 type Signals =
     { selectedNav: string }
 
@@ -30,49 +38,142 @@ for x in 1 .. 3 do
     itemStore.TryAdd((x, x), guid) |> ignore
     
 [<AutoOpen>]
-module AdaptiveExtensions =
-    let ( +. ) (a:aval<decimal>) (b:aval<decimal>) : aval<decimal> =
-        AVal.map2 (+) a b
-    let ( -. ) (a:aval<decimal>) (b:aval<decimal>) : aval<decimal> =
-        AVal.map2 (-) a b
-    let ( *. ) (a:aval<decimal>) (b:aval<decimal>) : aval<decimal> =
-        AVal.map2 (*) a b
-    
-type Statement =
-    { date: DateOnly
-      withdrawals: cval<decimal>
-      deposits: cval<decimal>
-      balance: aval<decimal> }
-    with
-        member this.changes = this.deposits -. this.withdrawals
-
-module Statement =
-    let initialStatement date =
-        let withdrawals = cval 0m
-        let deposits = cval 0m
-        { date = date
-          withdrawals = withdrawals
-          deposits = deposits
-          balance = deposits -. withdrawals }
+module AdaptiveOperators =
+    let ( +. ) a b = AVal.map2 (+) a b
+    let ( -. ) a b = AVal.map2 (-) a b
+    let ( *. ) a b = AVal.map2 (*) a b
+    let ( /. ) a b = AVal.map2 (/) a b
+    let (!) a = AVal.constant a
+    let (!~) a = cval a
+    let (!!) a = AVal.force a
         
-    let createStatement prev =
-        let withdrawals = cval 0m
-        let deposits = cval 0m
-        { date = prev.date.AddMonths(1)
-          withdrawals = withdrawals
-          deposits = deposits
-          balance = prev.balance +. deposits -. withdrawals }
+type AccountInputs =
+    { deposits:Map<DateOnly,cval<decimal>>
+      withdrawals:Map<DateOnly,cval<decimal>>
+      apy:cval<decimal> }
     
-    let statements =
-        let date = DateOnly(2025, 1, 1)
-        let mutable statement = initialStatement date
-        [| for i in 0..11 do
-               if i = 0 then
-                   yield statement
-               else
-                   statement <- createStatement statement
-                   yield statement |]
+type Account =
+    { apy:aval<decimal>
+      yieldAccruedDate:DateOnly
+      yieldAccrued:aval<decimal>
+      balance:aval<decimal> }
     
+type AccountEvent =
+    | AmountDeposited of {| date:DateOnly; amount: aval<decimal> |}
+    | AmountWithdrawn of {| date:DateOnly; amount: aval<decimal> |}
+    | YieldAccrued of {| date:DateOnly; amount: aval<decimal> |}
+    | YieldReceived of {| date:DateOnly; amount: aval<decimal> |}
+    | Snapshotted of {| date:DateOnly; account:Account |}
+module AccountEvent =
+    let toString (event:AccountEvent) =
+        match event with
+        | AmountDeposited e -> $"AmountDeposited(date={e.date}, amount={!!e.amount})"
+        | AmountWithdrawn e -> $"AmountWithdrawn(date={e.date}, amount={!!e.amount})"
+        | YieldAccrued e -> $"YieldAccrued(date={e.date}, amount={!!e.amount})"
+        | YieldReceived e -> $"YieldReceived(date={e.date}, amount={!!e.amount})"
+        | Snapshotted e -> $"Snapshotted(date={e.date}, balance={!!e.account.balance})"
+        
+type AccountCommand =
+    | StartDay of DateOnly
+    | Deposit of DateOnly * aval<decimal>
+    | Withdraw of DateOnly * aval<decimal>
+    | Snapshot of DateOnly
+    
+module Account =
+    let initial startDate apy : Account =
+        { apy = apy
+          yieldAccruedDate = startDate
+          yieldAccrued = AVal.constant 0m
+          balance = AVal.constant 0m }
+    let evolve state event : Account =
+        match event with
+        | AmountDeposited e ->
+            { state with balance = state.balance +. e.amount }
+        | AmountWithdrawn e ->
+            { state with balance = state.balance -. e.amount }
+        | YieldAccrued e ->
+            { state with
+                yieldAccruedDate = e.date
+                yieldAccrued = state.yieldAccrued +. e.amount }
+        | YieldReceived e ->
+            { state with balance = state.balance +. e.amount }
+        | Snapshotted _ -> state
+        
+    let fold:Account -> AccountEvent seq -> Account = Seq.fold evolve
+    
+    let decide command (account:Account) : AccountEvent list =
+        match command with
+        | StartDay date ->
+            let days = DateOnly.daysBetween account.yieldAccruedDate date
+            let dpy = account.apy /. !365m
+            let yieldAccrued = account.balance *. dpy *. !(decimal days)
+            [
+                YieldAccrued {| date = date; amount = yieldAccrued |}
+                if date.DayOfWeek = DayOfWeek.Friday then
+                    let yieldReceived = account.yieldAccrued +. yieldAccrued |> AVal.map (fun v -> Math.Round(v, 2))
+                    YieldReceived {| date = date; amount = yieldReceived |}
+            ]
+        | Deposit (date, amount) ->
+            [ AmountDeposited {| date = date; amount = amount |} ]
+        | Withdraw (date, amount) ->
+            let amount = AVal.map2 min account.balance amount
+            [ AmountWithdrawn {| date = date; amount = amount |} ]
+        | Snapshot date ->
+            [ Snapshotted {| date = date; account = account |} ]
+        
+type Model =
+    { startDate: DateOnly
+      endDate: DateOnly
+      inputs: AccountInputs
+      observedDate: DateOnly
+      account: Account
+      events: AccountEvent list }
+        
+module Model =
+    let initial (startDate:DateOnly, endDate:DateOnly, inputs:AccountInputs) : Model =
+        let account = Account.initial startDate inputs.apy
+        let events = [ Snapshotted {| date = startDate; account = account |} ]
+        { startDate = startDate
+          endDate = endDate
+          inputs = inputs
+          observedDate = startDate
+          account = account
+          events = events }
+    let evolve (model:Model) (date:DateOnly) : Model =
+        let inputs = model.inputs
+        let account = model.account
+        let deposit = inputs.deposits[date]
+        let withdrawal = inputs.withdrawals[date]
+        let commands =
+            [ StartDay date
+              Deposit (date, deposit)
+              Withdraw (date, withdrawal)
+              Snapshot date ]
+        let newEvents, newAccount =
+            (([], account), commands)
+            ||> Seq.fold (fun (e, a) c ->
+                let newEvents = Account.decide c a
+                let newAccount = Account.fold a newEvents
+                e @ newEvents, newAccount)
+        { model with
+            observedDate = date
+            events = model.events @ newEvents
+            account = newAccount }
+    let build startDate endDate inputs : Model =
+        let initialModel = initial (startDate, endDate, inputs)
+        let dates = DateOnly.range startDate endDate
+        (initialModel, dates) ||> Seq.fold evolve
+        
+let startDate = DateOnly(2025, 1, 1)
+let endDate = DateOnly(2025, 1, 31)
+let dates = DateOnly.range startDate endDate
+let deposits = dates |> List.map (fun d -> (d, cval 100m)) |> Map.ofList
+let withdrawals = dates |> List.map (fun d -> (d, cval 50m)) |> Map.ofList
+let accountInputs:AccountInputs =
+    { deposits = deposits
+      withdrawals = withdrawals
+      apy = cval 0.05m }
+let model = Model.build startDate endDate accountInputs
 
 module View =
     open FSharp.ViewEngine
@@ -103,7 +204,7 @@ module View =
             _children [
                 navLink ("home", "Home", "/")
                 navLink ("items", "Items", "/items")
-                navLink ("statements", "Statements", "/statements")
+                navLink ("account", "Account", "/account")
                 navLink ("time", "Time", "/time")
             ]
         ]
@@ -311,16 +412,47 @@ module View =
             ]
         ]
         
-    let statementsPage (statements:Statement[]) =
+    let accountPage (model:Model) =
+        Log.Information("👉 APY: {apy}", !!model.inputs.apy)
+        let dates = DateOnly.range model.startDate model.endDate
+        let snapshots =
+            model.events
+            |> List.choose (function
+                | AccountEvent.Snapshotted e -> Some (e.date, e.account)
+                | _ -> None)
+            |> Map.ofList
         Page.primary(
             attrs=[
-                _data ("on:deposits-change", "$amount = evt.detail.amount; @post(`/statements/${evt.detail.idx}/deposits`)")
-                _data ("on:withdrawals-change", "$amount = evt.detail.amount; @post(`/statements/${evt.detail.idx}/withdrawals`)")
+                _data ("on:deposit-changed", "$amount = evt.detail.amount; $date = evt.detail.date; @post(`/account/deposit`)")
+                _data ("on:withdrawal-changed", "$amount = evt.detail.amount; $date = evt.detail.date; @post(`/account/withdrawal`)")
             ],
             content=[
                 h1 [
                     _class "text-center text-3xl font-bold mb-4"
-                    _children "Statements"
+                    _children "Account"
+                ]
+                div [
+                    _class "p-4 flex flex-col"
+                    _children [
+                        span [
+                            _class "mb-1 text-sm font-medium"
+                            _children "Annual Percentage Yield (APY):"
+                        ]
+                        span [
+                            _class "mb-2 text-xs"
+                            _children "Compounded on Fridays"
+                        ]
+                        input [
+                            _class "input"
+                            _type "number"
+                            _data ("on:change", $$"""@post('/account/apy')""")
+                            _data ("bind", "apy")
+                            _value (string !!model.inputs.apy)
+                            _step 0.01
+                            _min 0
+                            _max 1
+                        ]
+                    ]
                 ]
                 div [
                     _class "overflow-x-auto"
@@ -331,11 +463,33 @@ module View =
                                 thead [
                                     tr [
                                         th [
-                                            _children "Date"
+                                            _class "flex flex-col"
+                                            _children [
+                                                span [
+                                                    _children "Date"
+                                                ]
+                                                span [
+                                                    _class "text-xs text-gray-500"
+                                                    _children "Day of Week"
+                                                ]
+                                            ]
                                         ]
-                                        for statement in statements do
+                                        for date in dates do
                                             th [
-                                                _children (statement.date.ToString("yyyy-MM-dd"))
+                                                _children [
+                                                    div [
+                                                        _class "flex flex-col"
+                                                        _children [
+                                                            span [
+                                                                _children (date.ToString("yyyy-MM-dd"))
+                                                            ]
+                                                            span [
+                                                                _class "text-xs text-gray-500"
+                                                                _children (date.DayOfWeek.ToString())
+                                                            ]
+                                                        ]
+                                                    ]
+                                                ]
                                             ]
                                     ]
                                 ]
@@ -346,15 +500,18 @@ module View =
                                                 th [
                                                     _children "Deposits"
                                                 ]
-                                                for i in 0..statements.Length - 1 do
+                                                for date in dates do
+                                                    let dateStr = date.ToString("yyyy-MM-dd")
+                                                    let deposit = model.inputs.deposits[date]
                                                     td [
                                                         _children [
                                                             input [
                                                                 _class "input"
                                                                 _type "number"
-                                                                _data ("on:change", $$"""el.dispatchEvent(new CustomEvent('deposits-change', { detail: { idx: {{ i }}, amount: el.value }, bubbles: true }))""")
-                                                                _value (string statements[i].withdrawals.Value)
+                                                                _data ("on:change", $$"""el.dispatchEvent(new CustomEvent('deposit-changed', { detail: { date: '{{ dateStr }}', amount: el.value }, bubbles: true }))""")
+                                                                _value (string deposit.Value)
                                                                 _min 0
+                                                                _step 100
                                                                 _max 1_000_000
                                                             ]
                                                         ]
@@ -366,16 +523,20 @@ module View =
                                                 th [
                                                     _children "Withdrawals"
                                                 ]
-                                                for i in 0..statements.Length - 1 do
+                                                for date in dates do
+                                                    let dateStr = date.ToString("yyyy-MM-dd")
+                                                    let withdrawal = model.inputs.withdrawals[date]
+                                                    let balance = snapshots[date].balance
                                                     td [
                                                         _children [
                                                             input [
                                                                 _class "input"
                                                                 _type "number"
-                                                                _data ("on:change", $$"""el.dispatchEvent(new CustomEvent('withdrawals-change', { detail: { idx: {{ i }}, amount: el.value }, bubbles: true }))""")
-                                                                _value (string statements[i].withdrawals.Value)
+                                                                _data ("on:change", $$"""el.dispatchEvent(new CustomEvent('withdrawal-changed', { detail: { date: '{{ dateStr }}', amount: el.value }, bubbles: true }))""")
+                                                                _value (string withdrawal.Value)
                                                                 _min 0
-                                                                _max 1_000_000
+                                                                _step 50
+                                                                _max (float !!balance)
                                                             ]
                                                         ]
                                                     ]
@@ -384,30 +545,17 @@ module View =
                                         tr [
                                             _children [
                                                 th [
-                                                    _children "Changes"
-                                                ]
-                                                for i in 0..statements.Length - 1 do
-                                                    td [
-                                                        _children [
-                                                            span [
-                                                                _class "input bg-gray-100"
-                                                                _children (statements[i].changes |> AVal.force |> string)
-                                                            ]
-                                                        ]
-                                                    ]
-                                            ]
-                                        ]
-                                        tr [
-                                            _children [
-                                                th [
+                                                    _class "border-t-2 border-gray-300"
                                                     _children "Balances"
                                                 ]
-                                                for i in 0..statements.Length - 1 do
+                                                for date in dates do
+                                                    let snapshot = snapshots[date]
                                                     td [
+                                                        _class "border-t-2 border-gray-300"
                                                         _children [
                                                             span [
                                                                 _class "input bg-gray-100"
-                                                                _children (statements[i].balance |> AVal.force |> string)
+                                                                _children (!!snapshot.balance |> _.ToString("C"))
                                                             ]
                                                         ]
                                                     ]
@@ -571,49 +719,56 @@ module Handler =
             ]
         ]
         
-    let getStatementsPage : HttpHandler =
+    let getAccountPage : HttpHandler =
         fun next ctx -> task {
-            let page = View.statementsPage Statement.statements
-            let signals = { selectedNav = "statements" }
+            let page = View.accountPage model
+            let signals = { selectedNav = "account" }
             if ctx.IsDatastar then
                 let ds = ctx.GetService<IDatastarService>()
                 do! patchElement ds page
-                do! patchSignals ds { selectedNav = "statements" }
-                do! pushUrl ds "/statements"
+                do! patchSignals ds { selectedNav = "account" }
+                do! pushUrl ds "/account"
                 return Some ctx
             else
                 return! renderPage (page, signals) next ctx
         }
         
-    let updateStatementDeposits (idx:int) : HttpHandler =
+    let updateDeposit : HttpHandler =
         fun next ctx -> task {
             if not ctx.IsDatastar then failwith "Not a Datastar request"
             let ds = ctx.GetService<IDatastarService>()
-            let! signals = ds.ReadSignalsAsync<{| amount:string |}>()
-            Log.Information("👉 Updating statement {i} deposits to {amount}", idx, signals.amount)
-            transact(fun () -> Statement.statements[idx].deposits.Value <- decimal signals.amount)
-            return! getStatementsPage next ctx
+            let! signals = ds.ReadSignalsAsync<{| date:DateOnly; amount:string |}>()
+            Log.Information("👉 Updating deposit {date} to {amount}", signals.date, signals.amount)
+            transact(fun () -> model.inputs.deposits[signals.date].Value <- decimal signals.amount)
+            return! getAccountPage next ctx
         }
         
-    let updateStatementWithdrawals (idx:int) : HttpHandler =
+    let updateWithdrawal : HttpHandler =
         fun next ctx -> task {
             if not ctx.IsDatastar then failwith "Not a Datastar request"
             let ds = ctx.GetService<IDatastarService>()
-            let! signals = ds.ReadSignalsAsync<{| amount:string |}>()
-            Log.Information("👉 Updating statement {i} withdrawals to {amount}", idx, signals.amount)
-            transact(fun () -> Statement.statements[idx].withdrawals.Value <- decimal signals.amount)
-            return! getStatementsPage next ctx
+            let! signals = ds.ReadSignalsAsync<{| date:DateOnly; amount:string |}>()
+            Log.Information("👉 Updating withdrawal {date} to {amount}", signals.date, signals.amount)
+            transact(fun () -> model.inputs.withdrawals[signals.date].Value <- decimal signals.amount)
+            return! getAccountPage next ctx
         }
         
-    let statementsApp : HttpHandler =
+    let updateYield : HttpHandler =
+        fun next ctx -> task {
+            if not ctx.IsDatastar then failwith "Not a Datastar request"
+            let ds = ctx.GetService<IDatastarService>()
+            let! signals = ds.ReadSignalsAsync<{| apy:decimal |}>()
+            Log.Information("👉 Updating APY to {apy}", signals.apy)
+            transact(fun () -> model.inputs.apy.Value <- signals.apy)
+            return! getAccountPage next ctx
+        }
+        
+    let accountApp : HttpHandler =
         choose [
-            routex "(/?)" >=> GET >=> getStatementsPage
-            routef "/%i/deposits" (fun idx -> choose [
-                POST >=> updateStatementDeposits idx
-            ])
-            routef "/%i/withdrawals" (fun idx -> choose [
-                POST >=> updateStatementWithdrawals idx
-            ])
+            routex "(/?)" >=> GET >=> getAccountPage
+            route "/apy" >=> POST >=> updateYield
+            route "/deposit" >=> POST >=> updateDeposit
+            route "/withdrawal" >=> POST >=> updateWithdrawal
         ]
         
     let getTimePage : HttpHandler =
@@ -655,7 +810,7 @@ module Handler =
         choose [
             route "/" >=> getHomePage
             subRoute "/items" itemsApp
-            subRoute "/statements" statementsApp
+            subRoute "/account" accountApp
             subRoute "/time" timeApp
         ]
 
