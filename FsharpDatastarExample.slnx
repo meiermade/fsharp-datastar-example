@@ -1,6 +1,3 @@
 <Solution>
-  <Folder Name="/src/">
-    <Project Path="src/App/App.fsproj" />
-  </Folder>
-  <Folder Name="/src/App/" />
+  <Project Path="src/App/App.fsproj" />
 </Solution>
