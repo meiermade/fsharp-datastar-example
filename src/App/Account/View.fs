@@ -115,18 +115,19 @@ let accountPage (model:Model) =
                                             ]
                                             for date in dates do
                                                 let dateStr = date.ToString("yyyy-MM-dd")
-                                                let withdrawal = !!model.inputs.withdrawals[date]
-                                                let balance = !!observations[date].balance
+                                                let withdrawal' = model.inputs.withdrawals[date]
+                                                let balance' = observations[date].balance
+                                                let originalBalance' = balance' +. withdrawal'
                                                 td [
                                                     _children [
                                                         input [
                                                             _class "input"
                                                             _type "number"
                                                             _data ("on:change", $$"""el.dispatchEvent(new CustomEvent('withdrawal-changed', { detail: { date: '{{ dateStr }}', amount: Number(el.value) }, bubbles: true }))""")
-                                                            _value (string withdrawal)
+                                                            _value (string !!withdrawal')
                                                             _min 0
                                                             _step 50
-                                                            _max (float balance)
+                                                            _max (float !!originalBalance')
                                                         ]
                                                     ]
                                                 ]
@@ -135,7 +136,7 @@ let accountPage (model:Model) =
                                     tr [
                                         _children [
                                             th [
-                                                _class "sticky left-0 bg-white z-10 border-t-2 border-gray-300 no-wrap"
+                                                _class "sticky left-0 bg-white z-10 border-t-2 border-gray-300 whitespace-nowrap"
                                                 _children "Accrued Yield"
                                             ]
                                             for date in dates do

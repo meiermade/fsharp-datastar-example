@@ -34,7 +34,7 @@ module AccountStatus =
         | WaitingForDeposit -> "WaitingForDeposit"
         | WaitingForWithdrawal -> "WaitingForWithdrawal"
         | WaitingForYieldReceipt -> "WaitingForYieldReceipt"
-        
+
 type Account =
     { observedDate:DateOnly
       status:AccountStatus
@@ -59,17 +59,10 @@ module AccountEvent =
         | YieldAccrued _ -> "YieldAccrued"
         | YieldReceived _ -> "YieldReceived"
         
-type AccountCommand =
-    | StartDay of DateOnly
-    | AccrueYield of DateOnly
-    | Deposit of DateOnly * aval<decimal>
-    | Withdraw of DateOnly * aval<decimal>
-    | ReceiveYield of DateOnly
-    
 module Account =
     let initial (startDate:DateOnly) apy =
         { observedDate = startDate
-          status = WaitingForYieldAccrual
+          status = WaitingForDeposit
           apy = apy
           lastYieldAccruedDate = startDate
           lastYieldReceivedDate = startDate
@@ -90,9 +83,9 @@ module Account =
                 balance = account.balance +. e.amount
                 status = WaitingForWithdrawal }
         | AmountWithdrawn e ->
+            let isFriday = account.observedDate.DayOfWeek = DayOfWeek.Friday
             let status =
-                if account.observedDate.DayOfWeek = DayOfWeek.Friday
-                then WaitingForYieldReceipt
+                if isFriday then WaitingForYieldReceipt
                 else WaitingForDayStart
             { account with
                 balance = account.balance -. e.amount
@@ -105,51 +98,34 @@ module Account =
         
     let fold:Account -> AccountEvent seq -> Account = Seq.fold evolve
     
-    let decide command (account:Account) : AccountEvent list =
-        match account.status, command with
-        | WaitingForDayStart, StartDay date ->
-            [ DayStarted date ]
-        | WaitingForYieldAccrual, AccrueYield date ->
+    let decide (inputs:Inputs) (account:Account) : AccountEvent list =
+        match account.status with
+        | WaitingForDayStart -> List.empty
+        | WaitingForYieldAccrual ->
+            let date = account.observedDate
             let days = DateOnly.daysBetween account.lastYieldAccruedDate date
             let dpy = account.apy /. !365m
             let yieldAccrued = account.balance *. dpy *. !(decimal days)
             [ YieldAccrued {| date = date; amount = yieldAccrued |} ]
-        | WaitingForDeposit, Deposit (date, amount) ->
-            [ AmountDeposited {| date = date; amount = amount |} ]
-        | WaitingForWithdrawal, Withdraw (date, amount) ->
-            let amount = AVal.map2 min account.balance amount
-            [ AmountWithdrawn {| date = date; amount = amount |} ]
-        | WaitingForYieldReceipt, ReceiveYield date  ->
-            let yieldReceived = account.yieldAccrued |> AVal.map (fun v -> Math.Round(v, 2))
-            [ YieldReceived {| date = date; amount = yieldReceived |} ]
-        | _ -> List.empty
-            
-    let next (inputs:Inputs) (account:Account) : AccountCommand list =
-        match account.status with
-        | WaitingForDayStart -> List.empty
-        | WaitingForYieldAccrual ->
-            [ AccrueYield account.observedDate ]
         | WaitingForDeposit ->
             let date = account.observedDate
             let amount = inputs.deposits |> Map.tryFind date |> Option.fail $"Deposit {date} not found"
-            [ Deposit (date, amount) ]
+            [ AmountDeposited {| date = date; amount = amount |} ]
         | WaitingForWithdrawal ->
             let date = account.observedDate
             let amount = inputs.withdrawals |> Map.tryFind date |> Option.fail $"Withdrawal {date} not found"
-            [ Withdraw (date, amount) ]
+            let amount = AVal.map2 min account.balance amount
+            [ AmountWithdrawn {| date = date; amount = amount |} ]
         | WaitingForYieldReceipt ->
-            [ ReceiveYield account.observedDate ]
+            let date = account.observedDate
+            let yieldReceived = account.yieldAccrued |> AVal.map (fun v -> Math.Round(v, 2))
+            [ YieldReceived {| date = date; amount = yieldReceived |} ]
             
 type ModelEvent =
     | DayStarted of DateOnly
     | AccountEvent of AccountEvent
     | AccountObserved of Account
     
-type ModelCommand =
-    | StartDay of DateOnly
-    | AccountCommand of AccountCommand
-    | ObserveAccount of DateOnly
-
 type ModelStatus =
     | WaitingForDayStart
     | WaitingForAccount
@@ -180,8 +156,11 @@ module Model =
     let evolve (model:Model) (event:ModelEvent) : Model =
         match event with
         | DayStarted date ->
+            let accountEvent = AccountEvent.DayStarted date
+            let account = Account.evolve model.account accountEvent
             { model with
                 observedDate = date
+                account = account
                 status = WaitingForAccount }
         | AccountEvent e ->
             let account = Account.evolve model.account e
@@ -201,49 +180,33 @@ module Model =
                 observations = model.observations |> Map.add account.observedDate account
                 status = status }
 
-    let decide command model : ModelEvent list =
-        match model.status, command with
-        | WaitingForDayStart, StartDay date ->
-            [ DayStarted date ]
-        | WaitingForAccount, AccountCommand cmd ->
-            Account.decide cmd model.account
-            |> List.map AccountEvent
-        | WaitingForObservation, ObserveAccount date ->
-            if model.observations.ContainsKey date
-            then List.empty
-            else [ AccountObserved model.account ]
-        | _ -> List.empty
-            
-    let next model: ModelCommand list =
-        match model with
-        | { status = Complete } -> List.empty
-        | { status = WaitingForDayStart } ->
+    let decide model : ModelEvent list =
+        match model.status with
+        | WaitingForDayStart ->
             let nextDate = model.observedDate.AddDays(1)
-            [ StartDay nextDate
-              AccountCommand (AccountCommand.StartDay nextDate) ]
-        | { status = WaitingForAccount } ->
-            Account.next model.inputs model.account
-            |> List.map AccountCommand
-        | { status = WaitingForObservation } ->
-            [ ObserveAccount model.observedDate ]
+            if nextDate > model.endDate then
+                List.empty
+            else
+                [ DayStarted nextDate ]
+        | WaitingForAccount ->
+            Account.decide model.inputs model.account
+            |> List.map AccountEvent
+        | WaitingForObservation ->
+            [ AccountObserved model.account ]
+        | _ -> List.empty
             
     let fold = Seq.fold evolve
         
-    let rec run model commands : Model =
-        match commands with
-        | [] ->
-            match next model with
-            | [] -> model
-            | nextCommands ->
-                run model nextCommands
-        | command :: rest ->
-            let events = decide command model
+    let rec run model : Model =
+        match decide model with
+        | [] -> model
+        | events ->
             let newModel = fold model events
-            run newModel rest
+            run newModel
             
     let build (startDate:DateOnly) (endDate:DateOnly) inputs : Model =
         let model = initial (startDate, endDate, inputs)
-        run model []
+        run model
         
 let startDate = DateOnly(2025, 1, 1)
 let endDate = DateOnly(2025, 1, 31)
