@@ -2,7 +2,6 @@
 
 open App
 open FSharp.Data.Adaptive
-open Serilog
 open System
 
 [<AutoOpen>]
@@ -14,199 +13,246 @@ module AdaptiveOperators =
     let (!) a = AVal.constant a
     let (!~) a = cval a
     let (!!) a = AVal.force a
+    
+type Decider<'E,'S> =
+    { state:'S
+      evolve:'S -> 'E -> 'S
+      decide:'S -> 'E list }
+    
+type Decider<'Eo,'Ei,'S> =
+    { state:'S
+      evolve:'S -> 'Ei -> 'S
+      decide:'S -> 'Ei list
+      lmape:'Eo -> 'Ei option
+      rmape:'Ei -> 'Eo option }
+    
+module Decider =
+    let evolve eo decider =
+        match decider.lmape eo with
+        | Some ei -> { decider with state = decider.evolve decider.state ei }
+        | None -> decider
+
+    let decide decider =
+        decider.decide decider.state
+        |> List.choose decider.rmape
+        
+    let isTerminal decider =
+        match decide decider with
+        | [] -> true
+        | _ -> false
+        
+    let dimap 
+        (lmape:'Eo -> 'Ei option)
+        (rmape:'Ei -> 'Eo option)
+        (decider:Decider<'Ei,'S>) : Decider<'Eo,'Ei,'S> =
+            { state = decider.state
+              evolve = decider.evolve
+              decide = decider.decide
+              lmape = lmape
+              rmape = rmape }
+            
+    let state (decider:Decider<'E,'S>) = decider.state
+            
+    let rec run (decider:Decider<'E,'S>) : Decider<'E,'S> =
+        match decider.decide decider.state with
+        | [] -> decider
+        | events ->
+            let newState = Seq.fold decider.evolve decider.state events
+            let newDecider = { decider with state = newState }
+            run newDecider
         
 type Inputs =
     { deposits:Map<DateOnly,cval<decimal>>
       withdrawals:Map<DateOnly,cval<decimal>>
       apy:cval<decimal> }
     
-type AccountStatus =
-    | WaitingForDayStart
-    | WaitingForYieldAccrual
-    | WaitingForDeposit
-    | WaitingForWithdrawal
-    | WaitingForYieldReceipt
-module AccountStatus =
-    let toString (state:AccountStatus) =
-        match state with
-        | WaitingForDayStart -> "WaitingForDayStart"
-        | WaitingForYieldAccrual -> "WaitingForYieldAccrual"
-        | WaitingForDeposit -> "WaitingForDeposit"
-        | WaitingForWithdrawal -> "WaitingForWithdrawal"
-        | WaitingForYieldReceipt -> "WaitingForYieldReceipt"
-
-type Account =
-    { observedDate:DateOnly
-      status:AccountStatus
-      apy:aval<decimal>
-      lastYieldAccruedDate:DateOnly
-      lastYieldReceivedDate:DateOnly
-      yieldAccrued:aval<decimal>
-      balance:aval<decimal> }
-    
-type AccountEvent =
-    | DayStarted of DateOnly
-    | AmountDeposited of {| date:DateOnly; amount: aval<decimal> |}
-    | AmountWithdrawn of {| date:DateOnly; amount: aval<decimal> |}
-    | YieldAccrued of {| date:DateOnly; amount: aval<decimal> |}
-    | YieldReceived of {| date:DateOnly; amount: aval<decimal> |}
-module AccountEvent =
-    let toString (event:AccountEvent) =
-        match event with
-        | DayStarted _ -> "DayStarted"
-        | AmountDeposited _ -> "AmountDeposited"
-        | AmountWithdrawn _ -> "AmountWithdrawn"
-        | YieldAccrued _ -> "YieldAccrued"
-        | YieldReceived _ -> "YieldReceived"
-        
 module Account =
-    let initial (startDate:DateOnly) apy =
-        { observedDate = startDate
-          status = WaitingForDeposit
-          apy = apy
-          lastYieldAccruedDate = startDate
-          lastYieldReceivedDate = startDate
-          yieldAccrued = !0m
-          balance = !0m }
-    let evolve account event =
-        match event with
-        | DayStarted date ->
-            { account with
-                observedDate = date
-                status = WaitingForYieldAccrual }
-        | YieldAccrued e ->
-            { account with
-                yieldAccrued = account.yieldAccrued +. e.amount
-                status = WaitingForDeposit }
-        | AmountDeposited e ->
-            { account with
-                balance = account.balance +. e.amount
-                status = WaitingForWithdrawal }
-        | AmountWithdrawn e ->
-            let isFriday = account.observedDate.DayOfWeek = DayOfWeek.Friday
-            let status =
-                if isFriday then WaitingForYieldReceipt
-                else WaitingForDayStart
-            { account with
-                balance = account.balance -. e.amount
-                status = status }
-        | YieldReceived e ->
-            { account with
-                yieldAccrued = account.yieldAccrued -. e.amount
-                balance = account.balance +. e.amount
-                status = WaitingForDayStart }
-        
-    let fold:Account -> AccountEvent seq -> Account = Seq.fold evolve
     
-    let decide (inputs:Inputs) (account:Account) : AccountEvent list =
-        match account.status with
-        | WaitingForDayStart -> List.empty
-        | WaitingForYieldAccrual ->
-            let date = account.observedDate
-            let days = DateOnly.daysBetween account.lastYieldAccruedDate date
-            let dpy = account.apy /. !365m
-            let yieldAccrued = account.balance *. dpy *. !(decimal days)
-            [ YieldAccrued {| date = date; amount = yieldAccrued |} ]
-        | WaitingForDeposit ->
-            let date = account.observedDate
-            let amount = inputs.deposits |> Map.tryFind date |> Option.fail $"Deposit {date} not found"
-            [ AmountDeposited {| date = date; amount = amount |} ]
-        | WaitingForWithdrawal ->
-            let date = account.observedDate
-            let amount = inputs.withdrawals |> Map.tryFind date |> Option.fail $"Withdrawal {date} not found"
-            let amount = AVal.map2 min account.balance amount
-            [ AmountWithdrawn {| date = date; amount = amount |} ]
-        | WaitingForYieldReceipt ->
-            let date = account.observedDate
-            let yieldReceived = account.yieldAccrued |> AVal.map (fun v -> Math.Round(v, 2))
-            [ YieldReceived {| date = date; amount = yieldReceived |} ]
+    type Status =
+        | WaitingForDayStart
+        | WaitingForYieldAccrual
+        | WaitingForDeposit
+        | WaitingForWithdrawal
+        | WaitingForYieldReceipt
+    module Status =
+        let toString (state:Status) =
+            match state with
+            | WaitingForDayStart -> "WaitingForDayStart"
+            | WaitingForYieldAccrual -> "WaitingForYieldAccrual"
+            | WaitingForDeposit -> "WaitingForDeposit"
+            | WaitingForWithdrawal -> "WaitingForWithdrawal"
+            | WaitingForYieldReceipt -> "WaitingForYieldReceipt"
+
+    type State =
+        { observedDate:DateOnly
+          inputs:Inputs
+          status:Status
+          lastYieldAccruedDate:DateOnly
+          lastYieldReceivedDate:DateOnly
+          yieldAccrued:aval<decimal>
+          balance:aval<decimal> }
+        
+    type Event =
+        | DayStarted of DateOnly
+        | AmountDeposited of {| date:DateOnly; amount: aval<decimal> |}
+        | AmountWithdrawn of {| date:DateOnly; amount: aval<decimal> |}
+        | YieldAccrued of {| date:DateOnly; amount: aval<decimal> |}
+        | YieldReceived of {| date:DateOnly; amount: aval<decimal> |}
+    module Event =
+        let toString (event:Event) =
+            match event with
+            | DayStarted _ -> "DayStarted"
+            | AmountDeposited _ -> "AmountDeposited"
+            | AmountWithdrawn _ -> "AmountWithdrawn"
+            | YieldAccrued _ -> "YieldAccrued"
+            | YieldReceived _ -> "YieldReceived"
             
-type ModelEvent =
-    | DayStarted of DateOnly
-    | AccountEvent of AccountEvent
-    | AccountObserved of Account
-    
-type ModelStatus =
-    | WaitingForDayStart
-    | WaitingForAccount
-    | WaitingForObservation
-    | Complete
-    
-type Model =
-    { startDate: DateOnly
-      endDate: DateOnly
-      inputs: Inputs
-      observedDate: DateOnly
-      status: ModelStatus
-      account: Account
-      observations:Map<DateOnly,Account>
-      events: ModelEvent list }
+    module Decider =
+        let initial (startDate:DateOnly) (inputs:Inputs) =
+            { observedDate = startDate
+              inputs = inputs
+              status = WaitingForDeposit
+              lastYieldAccruedDate = startDate
+              lastYieldReceivedDate = startDate
+              yieldAccrued = !0m
+              balance = !0m }
+        let evolve state event =
+            match event with
+            | DayStarted date ->
+                { state with
+                    observedDate = date
+                    status = WaitingForYieldAccrual }
+            | YieldAccrued e ->
+                { state with
+                    yieldAccrued = state.yieldAccrued +. e.amount
+                    status = WaitingForDeposit }
+            | AmountDeposited e ->
+                { state with
+                    balance = state.balance +. e.amount
+                    status = WaitingForWithdrawal }
+            | AmountWithdrawn e ->
+                let isFriday = state.observedDate.DayOfWeek = DayOfWeek.Friday
+                let status =
+                    if isFriday then WaitingForYieldReceipt
+                    else WaitingForDayStart
+                { state with
+                    balance = state.balance -. e.amount
+                    status = status }
+            | YieldReceived e ->
+                { state with
+                    yieldAccrued = state.yieldAccrued -. e.amount
+                    balance = state.balance +. e.amount
+                    status = WaitingForDayStart }
+            
+        let decide (state:State) : Event list =
+            match state.status with
+            | WaitingForDayStart -> List.empty
+            | WaitingForYieldAccrual ->
+                let date = state.observedDate
+                let days = DateOnly.daysBetween state.lastYieldAccruedDate date
+                let dpy = state.inputs.apy /. !365m
+                let yieldAccrued = state.balance *. dpy *. !(decimal days)
+                [ YieldAccrued {| date = date; amount = yieldAccrued |} ]
+            | WaitingForDeposit ->
+                let date = state.observedDate
+                let amount = state.inputs.deposits |> Map.tryFind date |> Option.fail $"Deposit {date} not found"
+                [ AmountDeposited {| date = date; amount = amount |} ]
+            | WaitingForWithdrawal ->
+                let date = state.observedDate
+                let amount = state.inputs.withdrawals |> Map.tryFind date |> Option.fail $"Withdrawal {date} not found"
+                let amount = AVal.map2 min state.balance amount
+                [ AmountWithdrawn {| date = date; amount = amount |} ]
+            | WaitingForYieldReceipt ->
+                let date = state.observedDate
+                let yieldReceived = state.yieldAccrued |> AVal.map (fun v -> Math.Round(v, 2))
+                [ YieldReceived {| date = date; amount = yieldReceived |} ]
         
+        let create startDate inputs : Decider<Event,State> =
+            { state = initial startDate inputs
+              evolve = evolve
+              decide = decide }
+            
 module Model =
-    let initial (startDate:DateOnly, endDate:DateOnly, inputs:Inputs) : Model =
-        { startDate = startDate
-          endDate = endDate
-          inputs = inputs
-          observedDate = startDate
-          status = WaitingForAccount
-          account = Account.initial startDate inputs.apy
-          observations = Map.empty
-          events = List.empty }
-
-    let evolve (model:Model) (event:ModelEvent) : Model =
-        match event with
-        | DayStarted date ->
-            let accountEvent = AccountEvent.DayStarted date
-            let account = Account.evolve model.account accountEvent
-            { model with
-                observedDate = date
-                account = account
-                status = WaitingForAccount }
-        | AccountEvent e ->
-            let account = Account.evolve model.account e
-            let status =
-                match account.status with
-                | AccountStatus.WaitingForDayStart -> WaitingForObservation
-                | _ -> WaitingForAccount
-            { model with
-                account = account
-                status = status }
-        | AccountObserved account ->
-            let status =
-                if model.observedDate = model.endDate
-                then Complete
-                else WaitingForDayStart
-            { model with
-                observations = model.observations |> Map.add account.observedDate account
-                status = status }
-
-    let decide model : ModelEvent list =
-        match model.status with
-        | WaitingForDayStart ->
-            let nextDate = model.observedDate.AddDays(1)
-            if nextDate > model.endDate then
-                List.empty
-            else
-                [ DayStarted nextDate ]
-        | WaitingForAccount ->
-            Account.decide model.inputs model.account
-            |> List.map AccountEvent
-        | WaitingForObservation ->
-            [ AccountObserved model.account ]
-        | _ -> List.empty
             
-    let fold = Seq.fold evolve
+    type Event =
+        | DayStarted of DateOnly
+        | AccountEvent of Account.Event
+        | AccountObserved of Account.State
         
-    let rec run model : Model =
-        match decide model with
-        | [] -> model
-        | events ->
-            let newModel = fold model events
-            run newModel
+    module Event =
+        let ofAccountEvent (e:Account.Event) = Some(AccountEvent e)
+        let toAccountEvent = function
+            | DayStarted date -> Some(Account.DayStarted date)
+            | AccountEvent e -> Some e
+            | AccountObserved _ -> None
+
+    type Status =
+        | WaitingForDayStart
+        | WaitingForObservation
+        | Running
+        
+    type State =
+        { startDate: DateOnly
+          endDate: DateOnly
+          inputs: Inputs
+          observedDate: DateOnly
+          status: Status
+          account: Decider<Event,Account.Event,Account.State>
+          observations:Map<DateOnly,Account.State>
+          events: Event list }
             
-    let build (startDate:DateOnly) (endDate:DateOnly) inputs : Model =
-        let model = initial (startDate, endDate, inputs)
-        run model
+    module Decider =
+        let initial (startDate:DateOnly, endDate:DateOnly, inputs:Inputs) : State =
+            let account =
+                Account.Decider.create startDate inputs
+                |> Decider.dimap Event.toAccountEvent Event.ofAccountEvent
+            { startDate = startDate
+              endDate = endDate
+              inputs = inputs
+              observedDate = startDate
+              status = Running
+              account = account
+              observations = Map.empty
+              events = List.empty }
+
+        let evolve (model: State) (event: Event) : State =
+            let newAccount = model.account |> Decider.evolve event
+            let newModel = { model with account = newAccount }
+            match event with
+            | DayStarted date ->
+                { newModel with
+                    observedDate = date
+                    status = Running }
+            | AccountObserved account ->
+                { newModel with
+                    observations = model.observations |> Map.add account.observedDate account
+                    status = WaitingForDayStart }
+            | AccountEvent _ -> newModel
+
+        let decide model : Event list =
+            match model.account |> Decider.decide with
+            | [] ->
+                match model.status with
+                | WaitingForDayStart ->
+                    let nextDate = model.observedDate.AddDays(1)
+                    if nextDate > model.endDate then
+                        []
+                    else
+                        [ DayStarted nextDate ]
+                | Running ->
+                    [ AccountObserved model.account.state ]
+                | _ -> List.empty
+            | events -> events
+            
+        let create startDate endDate inputs : Decider<Event,State> =
+            { state = initial (startDate, endDate, inputs)
+              evolve = evolve
+              decide = decide }
+                
+    let build startDate endDate inputs : State =
+        Decider.create startDate endDate inputs
+        |> Decider.run
+        |> Decider.state
         
 let startDate = DateOnly(2025, 1, 1)
 let endDate = DateOnly(2025, 1, 31)

@@ -6,7 +6,7 @@ open App.Account.Model
 open FSharp.ViewEngine
 open type Html
 
-let accountPage (model:Model) =
+let accountPage (model:Model.State) =
     let dates = DateOnly.range model.startDate model.endDate
     let observations = model.observations
     Page.primary(
