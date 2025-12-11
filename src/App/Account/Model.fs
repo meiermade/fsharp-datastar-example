@@ -26,41 +26,6 @@ type Decider<'Eo,'Ei,'S> =
       lmape:'Eo -> 'Ei option
       rmape:'Ei -> 'Eo option }
     
-module Decider =
-    let evolve eo decider =
-        match decider.lmape eo with
-        | Some ei -> { decider with state = decider.evolve decider.state ei }
-        | None -> decider
-
-    let decide decider =
-        decider.decide decider.state
-        |> List.choose decider.rmape
-        
-    let isTerminal decider =
-        match decide decider with
-        | [] -> true
-        | _ -> false
-        
-    let dimap 
-        (lmape:'Eo -> 'Ei option)
-        (rmape:'Ei -> 'Eo option)
-        (decider:Decider<'Ei,'S>) : Decider<'Eo,'Ei,'S> =
-            { state = decider.state
-              evolve = decider.evolve
-              decide = decider.decide
-              lmape = lmape
-              rmape = rmape }
-            
-    let state (decider:Decider<'E,'S>) = decider.state
-            
-    let rec run (decider:Decider<'E,'S>) : Decider<'E,'S> =
-        match decider.decide decider.state with
-        | [] -> decider
-        | events ->
-            let newState = Seq.fold decider.evolve decider.state events
-            let newDecider = { decider with state = newState }
-            run newDecider
-        
 type Inputs =
     { deposits:Map<DateOnly,cval<decimal>>
       withdrawals:Map<DateOnly,cval<decimal>>
@@ -167,11 +132,10 @@ module Account =
                 let yieldReceived = state.yieldAccrued |> AVal.map (fun v -> Math.Round(v, 2))
                 [ YieldReceived {| date = date; amount = yieldReceived |} ]
         
-        let create startDate inputs : Decider<Event,State> =
-            { state = initial startDate inputs
-              evolve = evolve
-              decide = decide }
-            
+        let create startDate inputs =
+            let initialState = initial startDate inputs
+            Decider.create initialState evolve decide
+
 module Model =
             
     type Event =
@@ -180,8 +144,8 @@ module Model =
         | AccountObserved of Account.State
         
     module Event =
-        let ofAccountEvent (e:Account.Event) = Some(AccountEvent e)
-        let toAccountEvent = function
+        let ofAccountEvent (e:Account.Event) = AccountEvent e
+        let tryToAccountEvent = function
             | DayStarted date -> Some(Account.DayStarted date)
             | AccountEvent e -> Some e
             | AccountObserved _ -> None
@@ -197,15 +161,14 @@ module Model =
           inputs: Inputs
           observedDate: DateOnly
           status: Status
-          account: Decider<Event,Account.Event,Account.State>
+          account: Account.State
           observations:Map<DateOnly,Account.State>
           events: Event list }
             
     module Decider =
-        let initial (startDate:DateOnly, endDate:DateOnly, inputs:Inputs) : State =
-            let account =
-                Account.Decider.create startDate inputs
-                |> Decider.dimap Event.toAccountEvent Event.ofAccountEvent
+        open DeciderOperators
+        
+        let initial startDate endDate inputs account : State =
             { startDate = startDate
               endDate = endDate
               inputs = inputs
@@ -215,39 +178,46 @@ module Model =
               observations = Map.empty
               events = List.empty }
 
-        let evolve (model: State) (event: Event) : State =
-            let newAccount = model.account |> Decider.evolve event
-            let newModel = { model with account = newAccount }
+        let evolve (state: State) (event: Event) : State =
             match event with
             | DayStarted date ->
-                { newModel with
+                { state with
                     observedDate = date
                     status = Running }
             | AccountObserved account ->
-                { newModel with
-                    observations = model.observations |> Map.add account.observedDate account
+                { state with
+                    observations = state.observations |> Map.add state.observedDate account
                     status = WaitingForDayStart }
-            | AccountEvent _ -> newModel
+            | AccountEvent _ -> state
 
-        let decide model : Event list =
-            match model.account |> Decider.decide with
-            | [] ->
-                match model.status with
-                | WaitingForDayStart ->
-                    let nextDate = model.observedDate.AddDays(1)
-                    if nextDate > model.endDate then
-                        []
-                    else
-                        [ DayStarted nextDate ]
-                | Running ->
-                    [ AccountObserved model.account.state ]
+        let decide state : Event list =
+            match state.status with
+            | WaitingForDayStart ->
+                let nextDate = state.observedDate.AddDays(1)
+                if nextDate > state.endDate then
+                    []
+                else
+                    [ DayStarted nextDate ]
+            | Running ->
+                match state.account.status with
+                | Account.WaitingForDayStart ->
+                    [ AccountObserved state.account ]
                 | _ -> List.empty
-            | events -> events
+            | _ -> List.empty
             
-        let create startDate endDate inputs : Decider<Event,State> =
-            { state = initial (startDate, endDate, inputs)
-              evolve = evolve
-              decide = decide }
+        let create startDate endDate inputs =
+            let accountDecider = Account.Decider.create startDate inputs
+            let accountDecider' =
+                accountDecider
+                |> Decider.adapt
+                    Event.tryToAccountEvent
+                    Event.ofAccountEvent
+                    _.account
+            let initialState = initial startDate endDate inputs accountDecider.state
+            let decider = Decider.create initialState evolve decide
+            (fun s a -> { s with account = a })
+            <!> decider
+            <*> accountDecider'
                 
     let build startDate endDate inputs : State =
         Decider.create startDate endDate inputs
