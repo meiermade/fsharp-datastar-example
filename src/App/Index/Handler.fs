@@ -25,5 +25,6 @@ let app:HttpHandler =
         route "/" >=> getHomePage
         subRoute "/items" Item.Handler.app
         subRoute "/account" Account.Handler.app
+        subRoute "/simple-account" SimpleAccount.Handler.app
         subRoute "/time" Time.Handler.app
     ]

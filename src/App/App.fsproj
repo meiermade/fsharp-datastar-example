@@ -12,6 +12,9 @@
     <Compile Include="Account\Model.fs" />
     <Compile Include="Account\View.fs" />
     <Compile Include="Account\Handler.fs" />
+    <Compile Include="SimpleAccount\Model.fs" />
+    <Compile Include="SimpleAccount\View.fs" />
+    <Compile Include="SimpleAccount\Handler.fs" />
     <Compile Include="Item\Model.fs" />
     <Compile Include="Item\View.fs" />
     <Compile Include="Item\Handler.fs" />

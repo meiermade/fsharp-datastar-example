@@ -31,6 +31,7 @@ let navbar =
             navLink ("home", "Home", "/")
             navLink ("items", "Items", "/items")
             navLink ("account", "Account", "/account")
+            navLink ("simple-account", "Simple Account", "/simple-account")
             navLink ("time", "Time", "/time")
         ]
     ]

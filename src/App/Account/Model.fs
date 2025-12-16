@@ -19,13 +19,6 @@ type Decider<'E,'S> =
       evolve:'S -> 'E -> 'S
       decide:'S -> 'E list }
     
-type Decider<'Eo,'Ei,'S> =
-    { state:'S
-      evolve:'S -> 'Ei -> 'S
-      decide:'S -> 'Ei list
-      lmape:'Eo -> 'Ei option
-      rmape:'Ei -> 'Eo option }
-    
 type Inputs =
     { deposits:Map<DateOnly,cval<decimal>>
       withdrawals:Map<DateOnly,cval<decimal>>
