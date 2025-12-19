@@ -22,40 +22,62 @@ let getAccountPage : HttpHandler =
             return! renderPage (page, signals) next ctx
     }
     
-let updateDeposit : HttpHandler =
+let updateCheckingDeposit : HttpHandler =
     fun next ctx -> task {
         if not ctx.IsDatastar then failwith "Not a Datastar request"
         let ds = ctx.GetService<IDatastarService>()
         let! signals = ds.ReadSignalsAsync<{| date:DateOnly; amount:decimal |}>()
-        Log.Information("👉 Updating deposit {date} to {amount}", signals.date, signals.amount)
-        Model.updateDeposit signals.date signals.amount
+        Log.Information("👉 Updating checking deposit {date} to {amount}", signals.date, signals.amount)
+        Model.updateCheckingDeposit signals.date signals.amount
         return! getAccountPage next ctx
     }
     
-let updateWithdrawal : HttpHandler =
+let updateSavingsTransfer : HttpHandler =
     fun next ctx -> task {
         if not ctx.IsDatastar then failwith "Not a Datastar request"
         let ds = ctx.GetService<IDatastarService>()
         let! signals = ds.ReadSignalsAsync<{| date:DateOnly; amount:decimal |}>()
-        Log.Information("👉 Updating withdrawal {date} to {amount}", signals.date, signals.amount)
-        Model.updateWithdrawal signals.date signals.amount
+        Log.Information("👉 Updating savings transfer {date} to {amount}", signals.date, signals.amount)
+        Model.updateSavingsTransfer signals.date signals.amount
         return! getAccountPage next ctx
     }
     
-let updateApy : HttpHandler =
+let updateSavingsWithdrawal : HttpHandler =
     fun next ctx -> task {
         if not ctx.IsDatastar then failwith "Not a Datastar request"
         let ds = ctx.GetService<IDatastarService>()
-        let! signals = ds.ReadSignalsAsync<{| apy:decimal |}>()
-        Log.Information("👉 Updating APY to {apy}", signals.apy)
-        Model.updateApy signals.apy
+        let! signals = ds.ReadSignalsAsync<{| date:DateOnly; amount:decimal |}>()
+        Log.Information("👉 Updating savings withdrawal {date} to {amount}", signals.date, signals.amount)
+        Model.updateSavingsWithdrawal signals.date signals.amount
+        return! getAccountPage next ctx
+    }
+    
+let updateCheckingApy : HttpHandler =
+    fun next ctx -> task {
+        if not ctx.IsDatastar then failwith "Not a Datastar request"
+        let ds = ctx.GetService<IDatastarService>()
+        let! signals = ds.ReadSignalsAsync<{| checkingApy:decimal |}>()
+        Log.Information("👉 Updating APY to {apy}", signals.checkingApy)
+        Model.updateCheckingApy signals.checkingApy
+        return! getAccountPage next ctx
+    }
+    
+let updateSavingsApy : HttpHandler =
+    fun next ctx -> task {
+        if not ctx.IsDatastar then failwith "Not a Datastar request"
+        let ds = ctx.GetService<IDatastarService>()
+        let! signals = ds.ReadSignalsAsync<{| savingsApy:decimal |}>()
+        Log.Information("👉 Updating APY to {apy}", signals.savingsApy)
+        Model.updateSavingsApy signals.savingsApy
         return! getAccountPage next ctx
     }
     
 let app : HttpHandler =
     choose [
         routex "(/?)" >=> GET >=> getAccountPage
-        route "/apy" >=> POST >=> updateApy
-        route "/deposit" >=> POST >=> updateDeposit
-        route "/withdrawal" >=> POST >=> updateWithdrawal
+        route "/checking-apy" >=> POST >=> updateCheckingApy
+        route "/savings-apy" >=> POST >=> updateSavingsApy
+        route "/checking-deposit" >=> POST >=> updateCheckingDeposit
+        route "/savings-transfer" >=> POST >=> updateSavingsTransfer
+        route "/savings-withdrawal" >=> POST >=> updateSavingsWithdrawal
     ]
