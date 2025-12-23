@@ -37,19 +37,6 @@ module Evolver =
         { initialState = initialState
           evolve = evolve }
         
-    let many (evolvers:Map<'K,Evolver<'E,'S>>) : Evolver<'K * 'E,Map<'K,'S>> =
-        let evolve states (k, e) =
-            let evolver = evolvers |> Map.tryFind k |> Option.fail $"No evolver for key '{k}'."
-            states
-            |> Map.change k (function
-                | Some s -> Some (evolver.evolve s e)
-                | None -> Some (evolver.evolve evolver.initialState e))
-        { initialState = evolvers |> Map.map (fun _ evolver -> evolver.initialState)
-          evolve = evolve }
-        
-    let withInitialState initialState (evolver:Evolver<'E,'S>) =
-        { evolver with initialState = initialState }
-        
     let adapt tryToEx toSx (evolver:Evolver<'Ex,'Sx>) : Evolver<'Ey,'Sy,'Sx> =
         { initialState = evolver.initialState
           evolve =
@@ -89,24 +76,6 @@ module Decider =
           evolve = evolve
           decide = decide }
         
-    let withInitialState initialState (decider:Decider<'C,'E,'S>) =
-        { decider with initialState = initialState }
-        
-    let many (decider:Decider<'C,'E,'S>) : Decider<'K * 'C,'K * 'E,Map<'K,'S>> =
-        let evolve states (k, e) =
-            states
-            |> Map.change k (function
-                | Some s -> Some (decider.evolve s e)
-                | None -> Some (decider.evolve decider.initialState e))
-        let decide (k, c) states =
-            states
-            |> Map.tryFind k
-            |> Option.map (fun s -> decider.decide c s |> List.map (fun e -> k, e))
-            |> Option.defaultValue List.empty
-        { initialState = Map.empty
-          evolve = evolve
-          decide = decide }
-        
     let adaptEvolver tryToEx toSx (evolver:Evolver<'Ex,'Sx>) : Decider<'Cy,'Ey,'Sy,'Sx> =
         { initialState = evolver.initialState
           evolve =
@@ -129,28 +98,153 @@ module Decider =
                   | Some cx -> decider.decide cx (toSx sy) |> List.map toEy
                   | None -> List.empty }
         
-    let map (f:'Sa -> 'Sb) (decider:Decider<_,_,'S,'Sa>) : Decider<_,_,'S,'Sb> =
-        { initialState = f decider.initialState
-          evolve = fun s e -> decider.evolve s e |> f
-          decide = decider.decide }
-        
-    let map2 (f:'Sa -> 'Sb -> 'Sc) (deciderA:Decider<_,_,'S,'Sa>) (deciderB:Decider<_,_,'S,'Sb>) : Decider<_,_,'S,'Sc> =
-        { initialState = f deciderA.initialState deciderB.initialState
+    let map (toSy:'Sx -> 'Sy) (decider:Decider<'C,'E,'S,'Sx>) : Decider<'C,'E,'S,'Sy> =
+        { initialState = toSy decider.initialState
           evolve =
               fun s e ->
-                  let newA = deciderA.evolve s e
-                  let newB = deciderB.evolve s e
-                  f newA newB
+                  let sx = decider.evolve s e
+                  toSy sx
+          decide = decider.decide }
+        
+    let map2 (f:'Sx -> 'Sy -> 'Sz) (deciderX:Decider<'C,'E,'S,'Sx>) (deciderY:Decider<'C,'E,'S,'Sy>) : Decider<'C,'E,'S,'Sz> =
+        { initialState =
+            let sx = deciderX.initialState
+            let sy = deciderY.initialState
+            f sx sy
+          evolve =
+              fun s e ->
+                  let sx = deciderX.evolve s e
+                  let sy = deciderY.evolve s e
+                  f sx sy
           decide =
               fun c s ->
-                  deciderA.decide c s
-                  @ deciderB.decide c s }
+                  deciderX.decide c s
+                  @ deciderY.decide c s }
         
     let apply f x = map2 id f x
-
+    
 module DeciderOperators =
     let (<!>) = Decider.map
     let (<*> ) = Decider.apply
+    
+type Reactor<'C,'E,'Sx,'Sy> =
+    { initialState:'Sy
+      decide:'C -> 'Sx -> 'E list
+      evolve:'Sx -> 'E -> 'Sy
+      resume:'Sx -> 'C list
+      react:'Sx -> 'E -> 'C list }
+    
+type Reactor<'C,'E,'S> = Reactor<'C,'E,'S,'S>
+    
+module Reactor =
+    let create initialState evolve decide resume react =
+        { initialState = initialState
+          evolve = evolve
+          decide = decide
+          resume = resume
+          react = react }
+        
+    let adaptDecider tryToCx tryToEx toEy toSx (decider:Decider<'Cx,'Ex,'Sx>) : Reactor<'Cy,'Ey,'Sy,'Sx> =
+        { initialState = decider.initialState
+          evolve =
+              fun sy ey ->
+                  match tryToEx ey with
+                  | Some ex -> decider.evolve (toSx sy) ex
+                  | None -> toSx sy
+          decide =
+              fun cy sy ->
+                  match tryToCx cy with
+                  | Some cx -> decider.decide cx (toSx sy) |> List.map toEy
+                  | None -> List.empty
+          resume = fun _sy -> List.empty
+          react = fun _sy _ey -> List.empty }
+        
+    let adapt toCy tryToCx tryToEx toEy toSx (reactor:Reactor<'Cx,'Ex,'Sx>) : Reactor<'Cy,'Ey,'Sy,'Sx> =
+        { initialState = reactor.initialState
+          evolve =
+              fun sy ey ->
+                  match tryToEx ey with
+                  | Some ex -> reactor.evolve (toSx sy) ex
+                  | None -> toSx sy
+          decide =
+              fun cy sy ->
+                  match tryToCx cy with
+                  | Some cx -> reactor.decide cx (toSx sy) |> List.map toEy
+                  | None -> List.empty
+          resume =
+              fun sy ->
+                  reactor.resume (toSx sy)
+                  |> List.map toCy
+          react =
+              fun sy ey ->
+                  match tryToEx ey with
+                  | Some ex ->
+                      let cxl = reactor.react (toSx sy) ex
+                      cxl |> List.map toCy
+                  | None -> List.empty }
+        
+    let map (toSy:'Sx -> 'Sy) (reactor:Reactor<'C,'E,'S,'Sx>) : Reactor<'C,'E,'S,'Sy> =
+        { initialState = toSy reactor.initialState
+          evolve =
+              fun s e ->
+                  let sx = reactor.evolve s e
+                  toSy sx
+          decide = reactor.decide
+          resume = reactor.resume
+          react = reactor.react }
+        
+    let map2 (f:'Sx -> 'Sy -> 'Sz) (reactorX:Reactor<'C,'E,'S,'Sx>) (reactorY:Reactor<'C,'E,'S,'Sy>) : Reactor<'C,'E,'S,'Sz> =
+        { initialState =
+            let sx = reactorX.initialState
+            let sy = reactorY.initialState
+            f sx sy
+          evolve =
+              fun s e ->
+                  let sx = reactorX.evolve s e
+                  let sy = reactorY.evolve s e
+                  f sx sy
+          decide =
+              fun c s ->
+                  reactorX.decide c s
+                  @ reactorY.decide c s
+          resume =
+              fun s ->
+                  let clx = reactorX.resume s
+                  let cly = reactorY.resume s
+                  clx @ cly
+          react =
+              fun s e ->
+                  let clx = reactorX.react s e
+                  let cly = reactorY.react s e
+                  clx @ cly }
+        
+    let apply f x = map2 id f x
+    
+    let run (commands:'C list) (reactor:Reactor<'C,'E,'S>) =
+        let rec fold s cl el =
+            match el with
+            | [] -> s, cl
+            | e::rel ->
+                let ns = reactor.evolve s e
+                let ncl = reactor.react s e
+                fold ns (cl @ ncl) rel
+                
+        let rec loop s cl =
+            match cl with
+            | [] ->
+                match reactor.resume s with
+                | [] -> s
+                | cl -> loop s cl
+            | c::rcl ->
+                let el = reactor.decide c s
+                let ns, ncl = fold s rcl el
+                loop ns ncl
+
+        loop reactor.initialState commands
+    
+module ReactorOperators =
+    let (<!>) = Reactor.map
+    let (<*> ) = Reactor.apply
     
 module AdaptiveOperators =
     open FSharp.Data.Adaptive

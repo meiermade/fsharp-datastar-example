@@ -3,6 +3,7 @@
 open App.Infrastructure.AdaptiveOperators
 open App.Common.View
 open App.Account.Model
+open FSharp.Data.Adaptive
 open FSharp.ViewEngine
 open type Html
 
@@ -11,9 +12,8 @@ let accountPage (model:Model.State) =
     let dates = observations |> Map.keys
     Page.primary(
         attrs=[
-            _data ("on:checking-deposit-changed", "$amount = evt.detail.amount; $date = evt.detail.date; @post(`/account/checking-deposit`)")
-            _data ("on:savings-transfer-changed", "$amount = evt.detail.amount; $date = evt.detail.date; @post(`/account/savings-transfer`)")
-            _data ("on:savings-withdrawal-changed", "$amount = evt.detail.amount; $date = evt.detail.date; @post(`/account/savings-withdrawal`)")
+            _data ("on:paycheck-changed", "$amount = evt.detail.amount; $date = evt.detail.date; @post(`/account/paycheck`)")
+            _data ("on:rent-changed", "$amount = evt.detail.amount; $date = evt.detail.date; @post(`/account/rent`)")
         ],
         content=[
             h1 [
@@ -110,17 +110,17 @@ let accountPage (model:Model.State) =
                                         _children [
                                             th [
                                                 _class "bg-white z-10"
-                                                _children "Checking Deposit"
+                                                _children "Paycheck"
                                             ]
                                             for date in dates do
                                                 let dateStr = date.ToString("yyyy-MM-dd")
-                                                let amount' = model.inputs.checkingDeposits[date]
+                                                let amount' = model.inputs.paycheck[date]
                                                 td [
                                                     _children [
                                                         input [
                                                             _class "input input-sm"
                                                             _type "number"
-                                                            _data ("on:change", $$"""el.dispatchEvent(new CustomEvent('checking-deposit-changed', { detail: { date: '{{ dateStr }}', amount: Number(el.value) }, bubbles: true }))""")
+                                                            _data ("on:change", $$"""el.dispatchEvent(new CustomEvent('paycheck-changed', { detail: { date: '{{ dateStr }}', amount: Number(el.value) }, bubbles: true }))""")
                                                             _value (string !!amount')
                                                             _min 0
                                                             _step 50
@@ -134,23 +134,20 @@ let accountPage (model:Model.State) =
                                         _children [
                                             th [
                                                 _class "bg-white z-10"
-                                                _children "Savings Transfer"
+                                                _children "Rent"
                                             ]
                                             for date in dates do
                                                 let dateStr = date.ToString("yyyy-MM-dd")
-                                                let balance' = observations[date].accounts[Model.checkingAccountId].balance
-                                                let amount' = model.inputs.savingsTransfers[date]
-                                                let originalBalance' = balance' +. amount'
+                                                let amount' = model.inputs.rent[date]
                                                 td [
                                                     _children [
                                                         input [
                                                             _class "input input-sm"
                                                             _type "number"
-                                                            _data ("on:change", $$"""el.dispatchEvent(new CustomEvent('savings-transfer-changed', { detail: { date: '{{ dateStr }}', amount: Number(el.value) }, bubbles: true }))""")
+                                                            _data ("on:change", $$"""el.dispatchEvent(new CustomEvent('rent-changed', { detail: { date: '{{ dateStr }}', amount: Number(el.value) }, bubbles: true }))""")
                                                             _value (string !!amount')
                                                             _min 0
                                                             _step 50
-                                                            _max (float !!originalBalance')
                                                         ]
                                                     ]
                                                 ]
@@ -159,39 +156,16 @@ let accountPage (model:Model.State) =
                                     tr [
                                         _children [
                                             th [
-                                                _class "bg-white z-10"
-                                                _children "Savings Withdrawal"
-                                            ]
-                                            for date in dates do
-                                                let dateStr = date.ToString("yyyy-MM-dd")
-                                                let balance' = observations[date].accounts[Model.savingsAccountId].balance
-                                                let amount' = model.inputs.savingsWithdrawals[date]
-                                                let originalBalance' = balance' +. amount'
-                                                td [
-                                                    _children [
-                                                        input [
-                                                            _class "input input-sm"
-                                                            _type "number"
-                                                            _data ("on:change", $$"""el.dispatchEvent(new CustomEvent('savings-withdrawal-changed', { detail: { date: '{{ dateStr }}', amount: Number(el.value) }, bubbles: true }))""")
-                                                            _value (string !!amount')
-                                                            _min 0
-                                                            _step 50
-                                                            _max (float !!originalBalance')
-                                                        ]
-                                                    ]
-                                                ]
-                                        ]
-                                    ]
-                                    tr [
-                                        _children [
-                                            th [
-                                                _class "bg-white z-10 border-t-2 border-gray-300 whitespace-nowrap"
+                                                _class "bg-white z-10 whitespace-nowrap"
                                                 _children "Checking Yield Balance"
                                             ]
                                             for date in dates do
-                                                let balance = !!observations[date].accounts[Model.checkingYieldAccountId].balance
+                                                let balance =
+                                                    observations[date].accounts
+                                                    |> Map.tryFind Model.checkingYieldAccountId
+                                                    |> Option.map AVal.force
+                                                    |> Option.defaultValue 0m
                                                 td [
-                                                    _class "border-t-2 border-gray-300"
                                                     _children [
                                                         span [
                                                             _class "input input-sm bg-gray-100"
@@ -208,7 +182,11 @@ let accountPage (model:Model.State) =
                                                 _children "Savings Yield Balance"
                                             ]
                                             for date in dates do
-                                                let balance = !!observations[date].accounts[Model.savingsYieldAccountId].balance
+                                                let balance =
+                                                    observations[date].accounts
+                                                    |> Map.tryFind Model.savingsYieldAccountId
+                                                    |> Option.map AVal.force
+                                                    |> Option.defaultValue 0m
                                                 td [
                                                     _children [
                                                         span [
@@ -226,7 +204,11 @@ let accountPage (model:Model.State) =
                                                 _children "Checking Balance"
                                             ]
                                             for date in dates do
-                                                let balance = !!observations[date].accounts[Model.checkingAccountId].balance
+                                                let balance =
+                                                    observations[date].accounts
+                                                    |> Map.tryFind Model.checkingAccountId
+                                                    |> Option.map AVal.force
+                                                    |> Option.defaultValue 0m
                                                 td [
                                                     _children [
                                                         span [
@@ -244,7 +226,11 @@ let accountPage (model:Model.State) =
                                                 _children "Savings Balance"
                                             ]
                                             for date in dates do
-                                                let balance = !!observations[date].accounts[Model.savingsAccountId].balance
+                                                let balance =
+                                                    observations[date].accounts
+                                                    |> Map.tryFind Model.savingsAccountId
+                                                    |> Option.map AVal.force
+                                                    |> Option.defaultValue 0m
                                                 td [
                                                     _children [
                                                         span [

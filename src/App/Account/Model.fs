@@ -10,9 +10,8 @@ type AccountId = AccountId of string
 type Inputs =
     { startDate:DateOnly
       endDate:DateOnly
-      checkingDeposits:Map<DateOnly,cval<decimal>>
-      savingsTransfers:Map<DateOnly,cval<decimal>>
-      savingsWithdrawals:Map<DateOnly,cval<decimal>>
+      paycheck:Map<DateOnly,cval<decimal>>
+      rent:Map<DateOnly,cval<decimal>>
       checkingApy:cval<decimal>
       savingsApy:cval<decimal> }
     
@@ -20,65 +19,62 @@ module Constants =
     let zero = !0m
     let dayCount = !365m
     
-module Account =
+// TODO: create yield bearing account that has two accounts as reactor to capitalize on schedule
+module Accounts =
     
-    type AccountType =
-        | Nominal
-        | Real
-        
-    type Account =
-        { id:AccountId
-          accountType:AccountType }
+    type Transaction =
+        { description:string
+          fromAccountId:AccountId
+          toAccountId:AccountId
+          amount:aval<decimal> }
     
-    type State =
-        { account:Account
-          balance:aval<decimal> }
+    type State = Map<AccountId,aval<decimal>>
     module State =
-        let initial account =
-            { account = account
-              balance = Constants.zero }
-        
+        let initial = Map.empty
+
     type Event =
-        | Deposited of {| amount:aval<decimal> |}
-        | Withdrawn of {| amount:aval<decimal> |}
+        | Transacted of Transaction
         
     module Evolver =
         let evolve (state:State) (event:Event) =
             match event with
-            | Deposited e ->
-                { state with
-                    balance = state.balance +. e.amount }
-            | Withdrawn e ->
-                { state with
-                    balance = state.balance -. e.amount }
+            | Transacted e ->
+                let fromAccountBalance = state |> Map.tryFind e.fromAccountId |> Option.defaultValue !0m
+                let toAccountBalance = state |> Map.tryFind e.toAccountId |> Option.defaultValue !0m
+                let newFromAccountBalance = fromAccountBalance -. e.amount
+                let newToAccountBalance = toAccountBalance +. e.amount
+                state
+                |> Map.add e.fromAccountId newFromAccountBalance
+                |> Map.add e.toAccountId newToAccountBalance
                 
-        let create accountType =
-            let initialState = State.initial accountType
-            Evolver.create initialState evolve
+        let create = Evolver.create State.initial evolve
             
 module Observation =
+    
     type Event =
-        | DayStarted of {| date:DateOnly |}
-        | AccountEvent of {| accountId:AccountId; event:Account.Event |}
+        | DayStarted of DateOnly
+        | AccountsEvent of Accounts.Event
     module Event =
-        let ofAccountEvent (accountId, event) =
-            AccountEvent {| accountId = accountId; event = event |}
-        let tryToAccountEvent e =
+        let tryToAccountsEvent e =
             match e with
-            | DayStarted _ -> None
-            | AccountEvent e -> Some (e.accountId, e.event)
-        
+            | AccountsEvent e -> Some e
+            | _ -> None
+            
     type Command =
-        | StartDay of {| date:DateOnly |}
-        | AccrueYield of {| balanceAccountId:AccountId; revenueAccountId:AccountId; yieldAccountId:AccountId; apy:aval<decimal> |}
-        | ReceiveYield of {| balanceAccountId:AccountId; yieldAccountId:AccountId |}
-        | Transact of {| fromAccountId:AccountId; toAccountId:AccountId; amount:aval<decimal> |}
-    module Command =
-        let tryToAccountCommand _c = None
-        
+        | StartDay of DateOnly
+        | AccrueYield of
+            {| balanceAccountId:AccountId
+               externalAccountId:AccountId
+               yieldAccountId:AccountId
+               apy:aval<decimal> |}
+        | CapitalizeYield of
+            {| yieldAccountId:AccountId
+               balanceAccountId:AccountId |}
+        | Transact of Accounts.Transaction
+            
     type State =
         { observedDate:DateOnly
-          accounts:Map<AccountId,Account.State> }
+          accounts:Accounts.State }
     module State =
         let initial startDate accounts =
             { observedDate = startDate
@@ -87,66 +83,135 @@ module Observation =
     module Decider =
         open DeciderOperators
         
-        let evolve (state: State) (event: Event) : State =
+        let evolve (state:State) (event:Event) : State =
             match event with
-            | DayStarted e ->
+            | DayStarted date ->
                 { state with
-                    observedDate = e.date }
-            | AccountEvent _ -> state
+                    observedDate = date }
+            | AccountsEvent _ -> state
 
-        let decide command state : Event list =
+        let decide (command:Command) (state:State) =
             match command with
-            | StartDay c ->
-                [ DayStarted {| date = c.date |} ]
+            | StartDay date ->
+                [ DayStarted date ]
             | AccrueYield c ->
-                let balance = state.accounts[c.balanceAccountId].balance
+                let balance = state.accounts |> Map.tryFind c.balanceAccountId |> Option.defaultValue !0m
                 let amount = c.apy /. Constants.dayCount *. balance
-                [ AccountEvent {| accountId = c.revenueAccountId; event = Account.Withdrawn {| amount = amount |} |}
-                  AccountEvent {| accountId = c.yieldAccountId; event = Account.Deposited {| amount = amount |} |} ]
-            | ReceiveYield c ->
-                let amount = state.accounts[c.yieldAccountId].balance |> AVal.map (fun b -> Math.Round(b, 2))
-                [ AccountEvent {| accountId = c.yieldAccountId; event = Account.Withdrawn {| amount = amount |} |}
-                  AccountEvent {| accountId = c.balanceAccountId; event = Account.Deposited {| amount = amount |} |} ]
-            | Transact c ->
-                let fromAccount = state.accounts[c.fromAccountId]
+                let transacted =
+                    Accounts.Transacted
+                        { description = "yield_accrued"
+                          fromAccountId = c.externalAccountId
+                          toAccountId = c.yieldAccountId
+                          amount = amount }
+                [ AccountsEvent transacted ]
+            | CapitalizeYield c ->
+                let roundDown a = floor (a * 100m) / 100m
+                let roundDown' = AVal.map roundDown
                 let amount =
-                    match fromAccount.account.accountType with
-                    | Account.Nominal -> c.amount
-                    | Account.Real -> AVal.map2 min fromAccount.balance c.amount
-                [ AccountEvent {| accountId = c.fromAccountId; event = Account.Withdrawn {| amount = amount |} |}
-                  AccountEvent {| accountId = c.toAccountId; event = Account.Deposited {| amount = amount |} |} ]
-            
-        let create startDate (accounts:Account.Account list) =
-            let accountEvolvers =
-                accounts
-                |> Seq.map (fun a -> a.id, Account.Evolver.create a)
-                |> Map.ofSeq
+                    state.accounts
+                    |> Map.tryFind c.yieldAccountId
+                    |> Option.map roundDown'
+                    |> Option.defaultValue !0m
+                let transacted =
+                    Accounts.Transacted
+                        { description = "yield_capitalized"
+                          fromAccountId = c.yieldAccountId
+                          toAccountId = c.balanceAccountId
+                          amount = amount }
+                [ AccountsEvent transacted ]
+            | Transact t ->
+                [ AccountsEvent(Accounts.Transacted t) ]
+                
+        let create startDate =
             let accountsDecider =
-                Evolver.many accountEvolvers
+                Accounts.Evolver.create
                 |> Decider.adaptEvolver
-                    Event.tryToAccountEvent
+                    Event.tryToAccountsEvent
                     _.accounts
             let initialState = State.initial startDate accountsDecider.initialState
             let observationDecider = Decider.create initialState evolve decide
             (fun o a -> { o with accounts = a })
             <!> observationDecider
             <*> accountsDecider
-            
+
 module Model =
-    let revenueAccountId = AccountId "Revenue"
+    let externalAccountId = AccountId "External"
     let expenseAccountId = AccountId "Expense"
     let checkingAccountId = AccountId "Checking"
     let checkingYieldAccountId = AccountId "Checking Yield"
     let savingsAccountId = AccountId "Savings"
     let savingsYieldAccountId = AccountId "Savings Yield"
-    let accounts:Account.Account list =
-        [ { id = revenueAccountId; accountType = Account.Nominal }
-          { id = expenseAccountId; accountType = Account.Nominal }
-          { id = checkingAccountId; accountType = Account.Real }
-          { id = checkingYieldAccountId; accountType = Account.Nominal }
-          { id = savingsAccountId; accountType = Account.Real }
-          { id = savingsYieldAccountId; accountType = Account.Nominal } ]
     
+    type Event =
+        | Observed of Observation.State
+        | ObservationEvent of Observation.Event
+    module Event =
+        let tryToObservationEvent = function
+            | Observed _ -> None
+            | ObservationEvent e -> Some e
+        let ofObservationEvent e =
+            ObservationEvent e
+
+    type Command =
+        | StartDay of DateOnly
+        | AccrueCheckingYield of apy:aval<decimal>
+        | AccrueSavingsYield of apy:aval<decimal>
+        | CapitalizeCheckingYield
+        | CapitalizeSavingsYield
+        | DepositPaycheck of amount:aval<decimal>
+        | PayRent of amount:aval<decimal>
+        | TransferCheckingYield of amount:aval<decimal>
+        | Observe
+    module Command =
+        let tryToObservationCommand = function
+            | StartDay date -> Some(Observation.StartDay date)
+            | AccrueCheckingYield apy ->
+                Observation.AccrueYield
+                    {| balanceAccountId = checkingAccountId
+                       yieldAccountId = checkingYieldAccountId
+                       externalAccountId = externalAccountId
+                       apy = apy |}
+                |> Some
+            | AccrueSavingsYield apy ->
+                Observation.AccrueYield
+                    {| balanceAccountId = savingsAccountId
+                       yieldAccountId = savingsYieldAccountId
+                       externalAccountId = externalAccountId
+                       apy = apy |}
+                |> Some
+            | CapitalizeCheckingYield ->
+                Observation.CapitalizeYield
+                    {| yieldAccountId = checkingYieldAccountId
+                       balanceAccountId = checkingAccountId |}
+                |> Some
+            | CapitalizeSavingsYield ->
+                Observation.CapitalizeYield
+                    {| yieldAccountId = savingsYieldAccountId
+                       balanceAccountId = savingsAccountId |}
+                |> Some
+            | TransferCheckingYield amount ->
+                Observation.Transact
+                    { description = "transfer_checking_yield"
+                      fromAccountId = checkingAccountId
+                      toAccountId = savingsAccountId
+                      amount = amount }
+                |> Some
+            | DepositPaycheck amount ->
+                Observation.Transact
+                    { description = "paycheck"
+                      fromAccountId = externalAccountId
+                      toAccountId = checkingAccountId
+                      amount = amount }
+                |> Some
+            | PayRent amount ->
+                Observation.Transact
+                    { description = "rent"
+                      fromAccountId = checkingAccountId
+                      toAccountId = externalAccountId
+                      amount = amount }
+                |> Some
+            | Observe -> None
+
     type State =
         { inputs:Inputs
           observation:Observation.State
@@ -157,154 +222,90 @@ module Model =
               observation = observation
               observations = Map.empty }
         
-    type Event =
-        | Observed of {| observation:Observation.State |}
-        | ObservationEvent of {| event:Observation.Event |}
-    module Event =
-        let tryToObservationEvent = function
-            | Observed _ -> None
-            | ObservationEvent e -> Some e.event
-        let ofObservationEvent e =
-            ObservationEvent {| event = e |}
-
-    type Command =
-        | Observe
-        | ObservationCommand of Observation.Command
-    module Command =
-        let tryToObservationCommand = function
-            | Observe -> None
-            | ObservationCommand c -> Some c
-        
-    module Decider =
-        open DeciderOperators
+    module Reactor =
+        open ReactorOperators
         
         let evolve (state:State) (event:Event) =
             match event with
-            | Observed e -> { state with observations = state.observations |> Map.add e.observation.observedDate e.observation }
-            | ObservationEvent _ -> state
-            
+            | Observed o ->
+                { state with observations = state.observations |> Map.add o.observedDate o }
+            | _ -> state
+                
         let decide command state =
             match command with
-            | Observe -> [ Observed {| observation = state.observation |} ]
-            | ObservationCommand _c -> List.empty
+            | Observe ->
+                [ Observed state.observation ]
+            | _ -> List.empty
+            
+        let resume state =
+            let observedDate = state.observation.observedDate
+            if state.observations |> Map.containsKey observedDate then
+                if observedDate = state.inputs.endDate then
+                    []
+                else
+                    let nextDate = observedDate.AddDays 1
+                    [ StartDay nextDate ]
+            else
+                [ Observe ]
+                
+        let react state event =
+            match event with
+            | ObservationEvent(Observation.DayStarted d) ->
+                [ AccrueCheckingYield state.inputs.checkingApy
+                  AccrueSavingsYield state.inputs.savingsApy
+                  if d.DayOfWeek = DayOfWeek.Friday then
+                    CapitalizeCheckingYield
+                    CapitalizeSavingsYield
+                  DepositPaycheck state.inputs.paycheck[d]
+                  PayRent state.inputs.rent[d] ]
+            | ObservationEvent(Observation.AccountsEvent(Accounts.Transacted t)) ->
+                match t.description with
+                | "yield_capitalized" when t.toAccountId = checkingAccountId ->
+                    [ TransferCheckingYield t.amount ]
+                | _ -> List.empty
+            | Observed _ -> List.empty
             
         let create inputs =
-            let observationDecider =
-                Observation.Decider.create inputs.startDate accounts
-                |> Decider.adapt
+            let observationReactor =
+                Observation.Decider.create inputs.startDate
+                |> Reactor.adaptDecider
                     Command.tryToObservationCommand
                     Event.tryToObservationEvent
                     Event.ofObservationEvent
                     _.observation
-            let initialState = State.initial inputs observationDecider.initialState
-            let modelDecider = Decider.create initialState evolve decide
+            let initialState = State.initial inputs observationReactor.initialState
+            let modelReactor = Reactor.create initialState evolve decide resume react
             (fun m o -> { m with observation = o })
-            <!> modelDecider
-            <*> observationDecider
+            <!> modelReactor
+            <*> observationReactor
             
-    let private startDay date =
-        {| date = date |}
-        |> Observation.StartDay
-        |> ObservationCommand
-            
-    let private accrueCheckingYield checkingApy =
-        {| balanceAccountId = checkingAccountId
-           revenueAccountId = revenueAccountId
-           yieldAccountId = checkingYieldAccountId
-           apy = checkingApy |}
-        |> Observation.AccrueYield
-        |> ObservationCommand
-        
-    let private receiveCheckingYield =
-        {| yieldAccountId = checkingYieldAccountId
-           balanceAccountId = checkingAccountId |}
-        |> Observation.ReceiveYield
-        |> ObservationCommand
-        
-    let private accrueSavingsYield savingsApy =
-        {| balanceAccountId = savingsAccountId
-           revenueAccountId = revenueAccountId
-           yieldAccountId = savingsYieldAccountId
-           apy = savingsApy |}
-        |> Observation.AccrueYield
-        |> ObservationCommand
-        
-    let private receiveSavingsYield =
-        {| yieldAccountId = savingsYieldAccountId
-           balanceAccountId = savingsAccountId |}
-        |> Observation.ReceiveYield
-        |> ObservationCommand
-        
-    let private depositToChecking amount =
-        {| fromAccountId = revenueAccountId
-           toAccountId = checkingAccountId
-           amount = amount |}
-        |> Observation.Transact
-        |> ObservationCommand
-        
-    let private transferToSavings amount =
-        {| fromAccountId = checkingAccountId
-           toAccountId = savingsAccountId
-           amount = amount |}
-        |> Observation.Transact
-        |> ObservationCommand
-        
-    let private withdrawFromSavings amount =
-        {| fromAccountId = savingsAccountId
-           toAccountId = expenseAccountId
-           amount = amount |}
-        |> Observation.Transact
-        |> ObservationCommand
-        
-    let private dailyCommands inputs date =
-        [ startDay date
-          accrueCheckingYield inputs.checkingApy
-          accrueSavingsYield inputs.savingsApy
-          if date.DayOfWeek = DayOfWeek.Friday then
-              receiveCheckingYield
-              receiveSavingsYield
-          depositToChecking inputs.checkingDeposits[date]
-          transferToSavings inputs.savingsTransfers[date]
-          withdrawFromSavings inputs.savingsWithdrawals[date]
-          Observe ]
-                
+    // TODO: add resume to reactor so we can drive to terminal state
     let build (inputs:Inputs) : State =
-        let decider = Decider.create inputs
-        let dates = DateOnly.range inputs.startDate inputs.endDate
-        (decider.initialState, dates)
-        ||> Seq.fold (fun state date ->
-            let commands = dailyCommands inputs date
-            (state, commands)
-            ||> Seq.fold (fun state command ->
-                let events = decider.decide command state
-                (state, events) ||> Seq.fold decider.evolve))
+        let reactor = Reactor.create inputs
+        Reactor.run [ StartDay inputs.startDate ] reactor
         
 let startDate = DateOnly(2025, 1, 1)
 let endDate = DateOnly(2025, 1, 31)
 let dates = DateOnly.range startDate endDate
-let checkingDeposits = dates |> List.map (fun d -> (d, cval 0m)) |> Map.ofList
-let savingsTransfers = dates |> List.map (fun d -> (d, cval 0m)) |> Map.ofList
+let paycheck = dates |> List.map (fun d -> (d, cval 0m)) |> Map.ofList
+let rent = dates |> List.map (fun d -> (d, cval 0m)) |> Map.ofList
 let savingsWithdrawals = dates |> List.map (fun d -> (d, cval 0m)) |> Map.ofList
 
 let inputs:Inputs =
     { startDate = startDate
       endDate = endDate
-      checkingDeposits = checkingDeposits
-      savingsTransfers = savingsTransfers
-      savingsWithdrawals = savingsWithdrawals
-      checkingApy = cval 0.01m
-      savingsApy = cval 0.02m }
+      paycheck = paycheck
+      rent = rent
+      checkingApy = cval 0.1m
+      savingsApy = cval 0.2m }
     
 let model = Model.build inputs
 
-let updateCheckingDeposit date amount =
-    transact(fun () -> model.inputs.checkingDeposits[date].Value <- amount)
+let updatePaycheck date amount =
+    transact(fun () -> model.inputs.paycheck[date].Value <- amount)
     
-let updateSavingsTransfer date amount =
-    transact(fun () -> model.inputs.savingsTransfers[date].Value <- amount)
-    
-let updateSavingsWithdrawal date amount =
-    transact(fun () -> model.inputs.savingsWithdrawals[date].Value <- amount)
+let updateRent date amount =
+    transact(fun () -> model.inputs.rent[date].Value <- amount)
     
 let updateCheckingApy apy =
     transact(fun () -> model.inputs.checkingApy.Value <- apy)

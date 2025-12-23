@@ -22,33 +22,23 @@ let getAccountPage : HttpHandler =
             return! renderPage (page, signals) next ctx
     }
     
-let updateCheckingDeposit : HttpHandler =
+let updatePaycheck : HttpHandler =
     fun next ctx -> task {
         if not ctx.IsDatastar then failwith "Not a Datastar request"
         let ds = ctx.GetService<IDatastarService>()
         let! signals = ds.ReadSignalsAsync<{| date:DateOnly; amount:decimal |}>()
-        Log.Information("👉 Updating checking deposit {date} to {amount}", signals.date, signals.amount)
-        Model.updateCheckingDeposit signals.date signals.amount
+        Log.Information("👉 Updating paycheck {date} to {amount}", signals.date, signals.amount)
+        Model.updatePaycheck signals.date signals.amount
         return! getAccountPage next ctx
     }
     
-let updateSavingsTransfer : HttpHandler =
+let updateRent : HttpHandler =
     fun next ctx -> task {
         if not ctx.IsDatastar then failwith "Not a Datastar request"
         let ds = ctx.GetService<IDatastarService>()
         let! signals = ds.ReadSignalsAsync<{| date:DateOnly; amount:decimal |}>()
-        Log.Information("👉 Updating savings transfer {date} to {amount}", signals.date, signals.amount)
-        Model.updateSavingsTransfer signals.date signals.amount
-        return! getAccountPage next ctx
-    }
-    
-let updateSavingsWithdrawal : HttpHandler =
-    fun next ctx -> task {
-        if not ctx.IsDatastar then failwith "Not a Datastar request"
-        let ds = ctx.GetService<IDatastarService>()
-        let! signals = ds.ReadSignalsAsync<{| date:DateOnly; amount:decimal |}>()
-        Log.Information("👉 Updating savings withdrawal {date} to {amount}", signals.date, signals.amount)
-        Model.updateSavingsWithdrawal signals.date signals.amount
+        Log.Information("👉 Updating rent {date} to {amount}", signals.date, signals.amount)
+        Model.updateRent signals.date signals.amount
         return! getAccountPage next ctx
     }
     
@@ -77,7 +67,6 @@ let app : HttpHandler =
         routex "(/?)" >=> GET >=> getAccountPage
         route "/checking-apy" >=> POST >=> updateCheckingApy
         route "/savings-apy" >=> POST >=> updateSavingsApy
-        route "/checking-deposit" >=> POST >=> updateCheckingDeposit
-        route "/savings-transfer" >=> POST >=> updateSavingsTransfer
-        route "/savings-withdrawal" >=> POST >=> updateSavingsWithdrawal
+        route "/paycheck" >=> POST >=> updatePaycheck
+        route "/rent" >=> POST >=> updateRent
     ]
